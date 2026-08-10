@@ -1,4 +1,14 @@
-# native store plane
+# fabric-store-plane
+
+Split out of [`weft`](https://github.com/v-sekai-multiplayer-fabric/weft) with its
+history. weft keeps only the data plane and the NIF the BEAM loads. A plane is its own
+process, its own repository, and its own container.
+
+`thirdparty/harness` is
+[`fabric-harness`](https://github.com/v-sekai-multiplayer-fabric/fabric-harness), pulled
+in as a subtree. It carries the iceoryx2 C ABI and the shared limits, and this plane links
+it rather than linking iceoryx2.
+
 
 Goal: the store plane is a native process. SQLite runs inside it with a custom VFS, and
 that VFS reads and writes pages in FoundationDB. The BEAM reaches the plane over Eclipse
@@ -37,19 +47,19 @@ touches and no others. Three things follow, and none of them is true of the prot
   pages. There is no restore step and no transfer, so a large actor moves as fast as a
   small one.
 - **Compaction is not weft's to get wrong.** The Elixir replicator folds a log by hand,
-  and it has a race. `../spec/Store.lean` proves the rule the fold must obey. The page
+  and it has a race. weft's `docs/spec/Store.lean` proves the rule the fold must obey. The page
   layout moves that work into one place with one owner.
 
 ## The layout
 
-rivet's Depot layout, modelled in `../spec/Store.lean`:
+rivet's Depot layout, modelled in weft's `docs/spec/Store.lean`:
 
 - `PIDX/{pgno}` gives the txid that owns a page, so a read never scans the log.
 - `DELTA/{txid}/{chunk}` holds the pages of one commit.
 - `SHARD/{shard}/{as_of_txid}` holds a compacted base, versioned. Compaction adds a
   version and never overwrites one.
 
-`../spec/Store.lean` proves that compaction preserves every read, that the in-place fold
+weft's `docs/spec/Store.lean` proves that compaction preserves every read, that the in-place fold
 loses a page, and that a read touches two rows whatever the log holds.
 
 ## Read-ahead is the engineering
@@ -114,7 +124,7 @@ weft/db/<name>/PIN/<txid>           a read that holds a shard version
 ```
 
 A read finds the owner in PIDX and then reads one of DELTA or SHARD. So a read touches
-two rows whatever the log holds. `../spec/Store.lean` proves this as
+two rows whatever the log holds. weft's `docs/spec/Store.lean` proves this as
 `read_touches_two_rows`.
 
 ### A commit is one transaction
@@ -135,7 +145,7 @@ the next open clears every txid above the head.
 
 Compaction folds the log into a new shard version. It adds a version and never
 overwrites one. It clears a PIDX row only when that row points at a folded txid.
-`../spec/Store.lean` proves that these two rules preserve every read.
+weft's `docs/spec/Store.lean` proves that these two rules preserve every read.
 
 The trigger is a ratio and not a number. Compaction runs when the log is as large as the
 base. A ratio has no units to tune, and it moves with the load. A quiet actor never
@@ -149,7 +159,7 @@ Locking is a no-op, because an actor is the single writer of its own store.
 ## Measured
 
 Every number, and the cluster and the settings that produced it, is in
-`../logbook/store_plane.md`. Three results shape the design.
+weft's `weft's docs/logbook/store_plane.md`. Three results shape the design.
 
 A read costs what a local read costs. Point reads and a scan both land within 1.1 times of
 SQLite on a local file, because the page cache absorbs them and no round trip happens.
@@ -170,7 +180,7 @@ the network that check is a round trip for every query.
 
 The pragma tells SQLite that nothing else can change the file, so it trusts its page cache
 and stops the re-read. An actor is the single writer of its own store, so the statement is
-true. `../logbook/store_plane.md` holds what it was worth, which was more than the layout of
+true. weft's `weft's docs/logbook/store_plane.md` holds what it was worth, which was more than the layout of
 the pages.
 
 ## Two writers lost data, silently
@@ -235,7 +245,7 @@ means it did.
 
 Against the layout that committed each `xWrite` on its own, the search finds a witness at
 the first rung. Against the layout above, it covers the space and finds none.
-`../logbook/store_plane.md` holds how many candidates each run covered, because a count that
+weft's `weft's docs/logbook/store_plane.md` holds how many candidates each run covered, because a count that
 lives in two places goes stale in one of them.
 
 ## Every transaction retries
@@ -273,7 +283,7 @@ the caller as `SQLITE_READONLY`.
 
 1. Add read-ahead, which `../spec/Prefetch.lean` already models. This is the largest
    remaining piece, and it is what makes a scan affordable.
-2. Build the plane on the thread-per-core harness over iceoryx2, per `Weft`. Nothing
+2. Build the plane on the thread-per-core harness over iceoryx2, per weft's `lib/weft.ex`. Nothing
    calls the VFS yet except the programs in `native/storeplane/`.
 3. Write a pin when a read needs a version below the head, so a restore point survives
    compaction.
