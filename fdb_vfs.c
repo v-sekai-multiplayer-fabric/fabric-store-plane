@@ -2287,7 +2287,13 @@ static int vfs_open(sqlite3_vfs *vfs, const char *name, sqlite3_file *file, int 
 	// This is the same fault as every other one in this file's history — a short answer
 	// accepted as a complete one — and the same answer: say so instead.
 	const char *want = name ? name : "anonymous";
-	if (strlen(want) >= MAX_NAME) return SQLITE_CANTOPEN;
+	if (strlen(want) >= MAX_NAME) {
+		// pMethods has to go back before returning a failure. SQLite calls xClose on any
+		// file whose method table is set, including one xOpen refused, and fdb_close would
+		// then flush a file that was never opened.
+		f->base.pMethods = NULL;
+		return SQLITE_CANTOPEN;
+	}
 	snprintf(f->name, MAX_NAME, "%s", want);
 
 	// Decide the groups that name this database, before this open raises a fence.
@@ -2308,11 +2314,17 @@ static int vfs_open(sqlite3_vfs *vfs, const char *name, sqlite3_file *file, int 
 	// one small range read over this database's own prefix, and in the steady state it
 	// finds nothing.
 	int rc = weft_txn_recover_for(f->name);
-	if (rc != SQLITE_OK) return rc;
+	if (rc != SQLITE_OK) {
+		f->base.pMethods = NULL;
+		return rc;
+	}
 
 	struct open_ctx c = {f};
 	rc = run_txn(open_body, &c, 1, SQLITE_IOERR);
-	if (rc != SQLITE_OK) return rc;
+	if (rc != SQLITE_OK) {
+		f->base.pMethods = NULL;
+		return rc;
+	}
 
 	if (out_flags) *out_flags = flags;
 	return SQLITE_OK;
