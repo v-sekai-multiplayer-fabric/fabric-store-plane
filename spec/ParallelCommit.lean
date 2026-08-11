@@ -388,4 +388,122 @@ theorem recover_idempotent (w : World) : recover (recover w) = recover w := by
   · by_cases hi : implicitlyCommitted w <;> simp [recover, hs, hi, finish, abort]
   · simp [recover, hs]
 
+/-! ## Two things this model left out, and the defects they hide
+
+The model above says a txid is the only ordering this layout carries, and that a write is
+visible once the head reaches it. Both are simplifications, and each one is standing in
+front of a real fault in `fdb_vfs.c`.
+
+### A txid is reused, and nothing says whose pages are under it
+
+CockroachDB retries at a higher epoch, so a record from a dead attempt can never be mistaken
+for the live one. This layout has no epoch: a participant stages under `head + 1`, and a
+group that gives up leaves those pages exactly where the next group will stage.
+
+`weft_txn_abort` releases the lock and clears no pages, and `intentPresent` asks only whether
+*something* is staged under the txid. So a group can be judged implicitly committed on a dead
+group's pages. -/
+
+abbrev Group := Nat
+
+/-- A database that remembers which group staged under each txid. -/
+structure Staging where
+  head : Txid
+  stagedBy : Txid → Option Group
+
+/-- `QueryIntent` as `fdb_vfs.c` asks it: is anything there? -/
+def intentLoose (s : Staging) (tx : Txid) : Bool := (s.stagedBy tx).isSome
+
+/-- `QueryIntent` as it has to be asked: is *this group's* intent there? -/
+def intentExact (s : Staging) (tx : Txid) (g : Group) : Bool := (s.stagedBy tx) == some g
+
+/-- Group 1 staged under txid 4 and gave up without clearing. The head never moved, so group
+2 will stage under 4 as well — and here it has not yet done so. -/
+def deadGroupLeftovers : Staging :=
+  { head := 3, stagedBy := fun t => if t == 4 then some 1 else none }
+
+/-- **The defect.** Group 2's intent is not there, and the loose check says it is.
+
+A record naming `(db, 4)` for group 2 is then implicitly committed on group 1's pages, and
+what lands is a mixture of two groups' writes. An epoch, or clearing on abort, or a txid that
+is never reused, each close it; having none of the three does not. -/
+theorem loose_intent_accepts_a_dead_group :
+    intentLoose deadGroupLeftovers 4 = true ∧ intentExact deadGroupLeftovers 4 2 = false := by
+  constructor <;> rfl
+
+/-- Asked exactly, the same state is decided correctly and the group aborts. -/
+theorem exact_intent_rejects_a_dead_group : intentExact deadGroupLeftovers 4 2 = false := by
+  rfl
+
+/-- And a group that really did stage is still accepted, so the fix refuses nothing real. -/
+def ownStaging : Staging := { head := 3, stagedBy := fun t => if t == 4 then some 2 else none }
+
+theorem exact_intent_accepts_its_own : intentExact ownStaging 4 2 = true := by rfl
+
+/-! ### A head may move over a page that was never indexed
+
+`visible tx = tx ≤ head` assumes resolving a participant indexes every page it staged. It
+does not. `query_intent_body` enumerates the staged pages with a range read, stops at 4096,
+and ignores `more`; `resolve_body` writes a PIDX row for exactly the pages it was handed and
+then advances the head regardless.
+
+A page left out has no index row, so a read falls through to the shard and finds the version
+from before the commit. The head says the commit landed. -/
+
+abbrev Pgno := Nat
+
+/-- A database as a read actually sees it: an index, a log, and a base. -/
+structure Paged where
+  head : Txid
+  /-- PIDX: which txid owns a page. -/
+  index : Pgno → Option Txid
+  /-- The pages one commit staged. -/
+  staged : Pgno → Option Nat
+  /-- The compacted base, which is what a page without an index row falls back to. -/
+  base : Pgno → Option Nat
+
+/-- The read path of `page_from_store`, with no read-ahead in the way. -/
+def Paged.read (d : Paged) (p : Pgno) : Option Nat :=
+  match d.index p with
+  | some _ => d.staged p
+  | none => d.base p
+
+/-- Resolving, as `resolve_body` does it: index the pages that were enumerated, then move the
+head whatever happened. `covered` is what the range read returned. -/
+def resolvePaged (d : Paged) (tx : Txid) (covered : Pgno → Bool) : Paged :=
+  { d with
+    head := tx
+    index := fun p => if covered p ∧ (d.staged p).isSome then some tx else d.index p }
+
+/-- A commit that staged two pages, over a base that still holds the old values. -/
+def midCommit : Paged :=
+  { head := 3
+    index := fun _ => none
+    staged := fun p => if p == 0 then some 10 else if p == 1 then some 11 else none
+    base := fun p => if p == 0 then some 1 else if p == 1 then some 2 else none }
+
+/-- **The defect.** The enumeration stopped after page 0, so page 1 was never indexed. The
+head moved anyway, and page 1 reads as the value from before the commit.
+
+Nothing reports it. The database is structurally perfect and one page is a version behind,
+which is the fault `prove_crash` looks for arriving by a different route. -/
+theorem truncated_resolve_reads_the_old_page :
+    (resolvePaged midCommit 4 (fun p => p == 0)).read 1 = some 2 := by rfl
+
+/-- What it should have read, and does when the enumeration covered the commit. -/
+theorem full_resolve_reads_the_new_page :
+    (resolvePaged midCommit 4 (fun _ => true)).read 1 = some 11 := by rfl
+
+/-- The obligation, stated once: a resolve may only move the head when every staged page was
+indexed. Below that condition the read agrees with the commit for every page. -/
+def indexesEverything (d : Paged) (covered : Pgno → Bool) : Prop :=
+  ∀ p, (d.staged p).isSome → covered p
+
+theorem resolve_is_honest_when_it_covers_everything
+    (d : Paged) (tx : Txid) (covered : Pgno → Bool) (h : indexesEverything d covered)
+    (p : Pgno) (hp : (d.staged p).isSome) :
+    (resolvePaged d tx covered).read p = d.staged p := by
+  have hc : covered p = true := h p hp
+  simp [resolvePaged, Paged.read, hc, hp]
+
 end Weft.ParallelCommit
