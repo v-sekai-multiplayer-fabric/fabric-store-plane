@@ -41,6 +41,7 @@ extern "C" {
 int weft_fdb_start(const char* cluster_file);
 void weft_fdb_stop(void);
 int weft_vfs_register(int make_default);
+int weft_compact_due(sqlite3* db);
 }
 
 namespace {
@@ -282,8 +283,15 @@ void shard_loop(std::uint32_t shard) {
             break;
         }
         if (sample == nullptr) {
-            // Nothing waiting. Sleeping here costs latency and not throughput, because a
-            // shard with work never reaches this branch.
+            // Nothing waiting, so this is the moment to pay any fold a commit noticed was
+            // owed. Doing it here rather than inside a commit is the whole point: the
+            // thread is already idle, and no caller is waiting on it.
+            for (auto& [id, avatar] : avatars) {
+                (void)id;
+                if (weft_compact_due(avatar.db) != SQLITE_OK) break;
+            }
+            // Sleeping here costs latency and not throughput, because a shard with work
+            // never reaches this branch.
             (void)iox2_node_wait(&node, 0, 200 * 1000);
             continue;
         }

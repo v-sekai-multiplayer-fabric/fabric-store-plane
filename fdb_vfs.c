@@ -327,6 +327,10 @@ typedef struct {
 	// committing, because the group's record is what makes the write real.
 	uint64_t group_txnid;
 
+	// The log has reached the base and a fold is owed. It is a flag rather than a call,
+	// because the commit that notices is the worst moment to do the work.
+	int compact_due;
+
 	int64_t size;      // the file size, counting what is buffered
 	int64_t sent_size; // the file size the store holds
 
@@ -797,7 +801,12 @@ static int flush(FdbFile *f) {
 	f->log_pages += (uint64_t)f->ndirty;
 	clear_dirty(f);
 
-	return should_compact(f) ? compact(f) : SQLITE_OK;
+	// Note that a fold is owed; do not do it here. Folding on the commit that happens to
+	// trip the ratio charges one writer for work every writer caused, and the bill grows
+	// with the database: measured at 1.01 ms for an ordinary commit and 85 ms for the one
+	// that folded, on a run of 900. `weft_compact_due` is where it gets paid.
+	if (should_compact(f)) f->compact_due = 1;
+	return SQLITE_OK;
 }
 
 // ── Compaction ────────────────────────────────────────────────────────────────
@@ -1244,6 +1253,27 @@ static int txn_resolve_group(uint64_t txnid, int drop_record) {
 	return drop_record ? run_txn(drop_record_body, &c, 1, SQLITE_IOERR_WRITE) : SQLITE_OK;
 }
 
+// Pay the fold that a commit noticed was owed.
+//
+// A caller runs this when it is between pieces of work rather than inside one: a shard
+// thread with no request waiting, a job about to idle. Nothing here is hidden, and no
+// thread is started to do it, because a fold that happens on its own schedule is a fold
+// nobody can account for.
+//
+// Doing nothing is a valid outcome and the common one. The decision costs no round trip,
+// since both sizes live in the handle.
+int weft_compact_due(sqlite3 *db) {
+	FdbFile *f = file_of(db);
+	if (!f) return SQLITE_MISUSE;
+	if (!f->compact_due) return SQLITE_OK;
+	// A file in a group must not fold: compaction drops the shard version a reader is on,
+	// and it would do it while the group's own writes are staged and unresolved.
+	if (f->group_txnid) return SQLITE_OK;
+
+	f->compact_due = 0;
+	return compact(f);
+}
+
 // ── Recovery, which is the preventer process ──────────────────────────────────
 //
 // Anybody may find a staging record, and whoever does must decide it. The committer might
@@ -1564,6 +1594,14 @@ static int fdb_file_size(sqlite3_file *file, sqlite3_int64 *out) {
 static int fdb_close(sqlite3_file *file) {
 	FdbFile *f = (FdbFile *)file;
 	int rc = flush(f);
+
+	// A fold owed at close still gets paid, so a caller that never asks is no worse off
+	// than before this was deferred. It is off the commit path either way, which is the
+	// point: closing is already the slow moment.
+	if (rc == SQLITE_OK && f->compact_due && !f->group_txnid) {
+		f->compact_due = 0;
+		rc = compact(f);
+	}
 	clear_dirty(f);
 	free(f->dirty);
 	f->dirty = NULL;
