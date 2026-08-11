@@ -323,6 +323,10 @@ typedef struct {
 	uint64_t base_pages; // the pages of the newest shard version
 	uint64_t log_pages;  // the pages committed since that version
 
+	// The group this file joined, or zero. While it is set, a sync stages instead of
+	// committing, because the group's record is what makes the write real.
+	uint64_t group_txnid;
+
 	int64_t size;      // the file size, counting what is buffered
 	int64_t sent_size; // the file size the store holds
 
@@ -756,8 +760,19 @@ static int should_compact(FdbFile *f);
 // shape CockroachDB calls a parallel commit: the writes are staged, and the commit is
 // the single record that makes them real. The staged pages are safe to leave behind,
 // because `drop_unfinished_commit` clears any txid above the head at the next open.
+static int txn_stage_here(FdbFile *f);
+
 static int flush(FdbFile *f) {
 	if (f->ndirty == 0 && f->trunc_pages < 0 && f->size == f->sent_size) return SQLITE_OK;
+
+	// A file that joined a group does not commit when SQLite says so. It stages, and the
+	// group's record is what commits it later.
+	//
+	// This has to happen here rather than in a call after the fact. SQLite ends a
+	// statement by writing its pages and calling xSync, and this is xSync: by the time a
+	// caller could ask to stage, an ordinary flush would already have moved the head and
+	// the write would be visible on its own. That is the whole failure this catches.
+	if (f->group_txnid) return txn_stage_here(f);
 
 	struct flush_ctx c = {f, f->head + 1, 0, f->ndirty};
 	int rc;
@@ -932,6 +947,584 @@ static int compact(FdbFile *f) {
 	return SQLITE_OK;
 }
 
+// ── A commit across several databases ─────────────────────────────────────────
+//
+// `flush` commits one file, because that is what SQLite gives it: one `xSync` for one
+// database. So two databases cannot be committed together by anything above, and a grant
+// that takes an item from one and gives it to another is two transactions with a gap.
+//
+// This is the parallel commit protocol, modelled in ParallelCommits.tla. The names below
+// are that spec's, because a protocol implemented under different words is a protocol
+// nobody can check against its model:
+//
+//   intent write          the pages of one participant, staged under a txid whose head has
+//                         not moved. `flush` already writes exactly this shape for a
+//                         commit too large for one transaction.
+//   transaction record    `weft/txn/<txnid>`, holding the status and the participants.
+//   implicitly committed  the record is staging, and every participant's intent is there.
+//                         This is the commit point, and it costs one round.
+//   explicitly committed  the record says committed, which recovery or the committer
+//                         writes afterwards. It changes no read.
+//   resolve intent        move that participant's head, which is what makes its staged
+//                         pages reachable.
+//   prevent               raise that database's fence, so the staging writer can never
+//                         land. The fence is this layout's timestamp cache: it is the one
+//                         thing that stops a write that has not happened yet.
+//
+// The order is what makes it safe. Every participant stages first, and no head has moved,
+// so nothing is visible. One transaction then writes the record. That single write is the
+// commit: after it lands the group is implicitly committed whether or not this process
+// survives, because every intent is already durable and any other process can see both
+// facts. Moving the heads afterwards changes nothing about whether it committed.
+//
+// A crash before the record leaves intents nobody can reach, and recovery aborts them. A
+// crash after the record leaves a group that is committed but not resolved, and recovery
+// finishes it. There is no third case, which is the property `prove_parallel_commit`
+// looks for.
+//
+// One limit, and it is enforced rather than assumed: a participant must stage in one
+// FoundationDB transaction. That makes an intent all or nothing, so recovery can decide a
+// participant by reading one key instead of counting pages. A participant with more pages
+// than one transaction carries is refused at stage time.
+
+#define TXN_MAX_PARTS 16
+
+// The group being built. One at a time for the process, under a lock, because a group
+// spans databases that different threads own and the members must agree on the txid. Two
+// groups at once would need a map from txid to members, and nothing needs that yet.
+static pthread_mutex_t g_group_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct {
+	uint64_t txnid;
+	int nparts;
+	FdbFile *files[TXN_MAX_PARTS];
+	uint64_t txids[TXN_MAX_PARTS];
+	int open;
+} g_group;
+
+struct seq_ctx {
+	uint64_t txnid;
+};
+
+// The next group txid, from a counter in the store. Two planes must not choose the same
+// one, so it is a read and a write in one transaction rather than a clock or a guess.
+static fdb_error_t txn_seq_body(FDBTransaction *tr, void *ctx, int *final) {
+	(void)final;
+	struct seq_ctx *c = ctx;
+	uint8_t key[KEYMAX];
+	uint64_t seq = 0;
+	int got = 0;
+
+	int klen = snprintf((char *)key, KEYMAX, "weft/txn/NEXT");
+	fdb_error_t err = get_u64(tr, key, klen, &seq, &got);
+	if (err) return err;
+
+	c->txnid = got ? seq + 1 : 1;
+	set_u64(tr, key, klen, c->txnid);
+	return 0;
+}
+
+int weft_txn_begin(uint64_t *txnid) {
+	pthread_mutex_lock(&g_group_lock);
+
+	struct seq_ctx c = {0};
+	int rc = run_txn(txn_seq_body, &c, 1, SQLITE_IOERR_WRITE);
+	if (rc != SQLITE_OK) {
+		pthread_mutex_unlock(&g_group_lock);
+		return rc;
+	}
+
+	g_group.txnid = c.txnid;
+	g_group.nparts = 0;
+	g_group.open = 1;
+	if (txnid) *txnid = c.txnid;
+	return SQLITE_OK;
+}
+
+// True when this file belongs to this VFS. Defined below, beside the method table it
+// compares against, so the table stays in one place.
+static int is_fdb_file(const sqlite3_file *file);
+
+// The FdbFile behind an open connection. SQLite hands back the `sqlite3_file` it made, and
+// for this VFS that is an FdbFile, so no lookup table is needed.
+//
+// A connection on a different VFS reaches here if a caller passes one, and the check is
+// what stops this treating some other VFS's file as an FdbFile and reading nonsense.
+static FdbFile *file_of(sqlite3 *db) {
+	sqlite3_file *file = NULL;
+	if (sqlite3_file_control(db, "main", SQLITE_FCNTL_FILE_POINTER, &file) != SQLITE_OK) {
+		return NULL;
+	}
+	return is_fdb_file(file) ? (FdbFile *)file : NULL;
+}
+
+// Join a database to the group, before it is written to.
+//
+// From here until the group commits, this file's syncs stage instead of committing. That
+// ordering is the point: SQLite ends a statement by writing pages and calling xSync, so a
+// caller cannot stage after the fact — the write would already be visible on its own.
+int weft_txn_join(sqlite3 *db, uint64_t txnid) {
+	FdbFile *f = file_of(db);
+	if (!f || !g_group.open || g_group.txnid != txnid) return SQLITE_MISUSE;
+	if (g_group.nparts >= TXN_MAX_PARTS) return SQLITE_FULL;
+
+	// A participant that writes nothing is still a participant, so a reader of the record
+	// sees the whole group. Its staged txid stays its head until a sync says otherwise.
+	for (int i = 0; i < g_group.nparts; i++) {
+		if (g_group.files[i] == f) return SQLITE_OK;
+	}
+	g_group.files[g_group.nparts] = f;
+	g_group.txids[g_group.nparts] = f->head;
+	g_group.nparts++;
+	f->group_txnid = txnid;
+	return SQLITE_OK;
+}
+
+// Write this participant's intent: its pages, under a txid whose head does not move.
+//
+// This is `flush`'s staging half with the head left alone on purpose. Nothing can read
+// these pages, because no PIDX row points at them and the head is unchanged. The dirty
+// buffer is kept, so this process still sees its own writes and so resolving has the page
+// numbers it needs to build the index.
+static int txn_stage_here(FdbFile *f) {
+	// An intent has to be all or nothing, so recovery can decide a participant by reading
+	// one key instead of counting pages.
+	if (f->ndirty > ONE_TXN_PAGES) return SQLITE_TOOBIG;
+
+	struct flush_ctx c = {f, f->head + 1, 0, f->ndirty};
+	if (f->ndirty > 0) {
+		int rc = run_txn(delta_body, &c, 1, SQLITE_IOERR_WRITE);
+		if (rc != SQLITE_OK) return rc;
+	}
+
+	for (int i = 0; i < g_group.nparts; i++) {
+		if (g_group.files[i] == f) {
+			g_group.txids[i] = f->ndirty > 0 ? c.txid : f->head;
+			return SQLITE_OK;
+		}
+	}
+	// A sync on a file whose group flag is set but which is not in the group is a bug in
+	// the caller's bookkeeping, not something to commit around.
+	return SQLITE_MISUSE;
+}
+
+struct record_ctx {
+	uint64_t txnid;
+};
+
+// The commit. One transaction writes the record as staging, naming every participant and
+// the txid it staged under.
+//
+// After this lands the group is implicitly committed, and a caller may be told so. Every
+// intent is already durable, and any process can now read the record and reach them, so
+// the outcome no longer depends on this process being alive.
+static fdb_error_t record_body(FDBTransaction *tr, void *ctx, int *final) {
+	struct record_ctx *c = ctx;
+	uint8_t key[KEYMAX];
+
+	// The fence of every participant is read inside this transaction, so a participant
+	// that lost ownership while staging cannot be carried into the group: FoundationDB
+	// rejects the commit if any of those fences moved.
+	for (int i = 0; i < g_group.nparts; i++) {
+		fdb_error_t err = check_fence(tr, g_group.files[i], final);
+		if (err || *final) return err;
+	}
+
+	// A participant row is the txid it staged under and the file size that commit ends
+	// with. Recovery has no open handle, so everything it needs to move that head has to
+	// be in the record: the page numbers it can read back from the staged DELTA rows, but
+	// the size is nowhere else.
+	for (int i = 0; i < g_group.nparts; i++) {
+		uint8_t val[16];
+		put_be64(val, g_group.txids[i]);
+		put_be64(val + 8, (uint64_t)g_group.files[i]->size);
+		int klen = key_txn_part(key, c->txnid, g_group.files[i]->name);
+		fdb_transaction_set(tr, key, klen, val, 16);
+	}
+
+	uint8_t status = TXN_STAGING;
+	int klen = key_txn_status(key, c->txnid);
+	fdb_transaction_set(tr, key, klen, &status, 1);
+	return 0;
+}
+
+static int txn_resolve_group(uint64_t txnid, int drop_record);
+
+// Give up a group that was begun and not committed. No record was ever written, so there
+// is nothing to decide: the staged pages are unreachable and the next recovery sweep will
+// not even see them, because a group with no record is not a group.
+//
+// This exists because `weft_txn_begin` takes the lock and only a commit gives it back. A
+// caller whose stage fails has to be able to let go, or the next group waits forever.
+int weft_txn_abort(uint64_t txnid) {
+	if (!g_group.open || g_group.txnid != txnid) return SQLITE_MISUSE;
+	for (int i = 0; i < g_group.nparts; i++) g_group.files[i]->group_txnid = 0;
+	g_group.open = 0;
+	g_group.nparts = 0;
+	pthread_mutex_unlock(&g_group_lock);
+	return SQLITE_OK;
+}
+
+int weft_txn_commit(uint64_t txnid) {
+	if (!g_group.open || g_group.txnid != txnid) return SQLITE_MISUSE;
+
+	struct record_ctx c = {txnid};
+	int rc = run_txn(record_body, &c, 1, SQLITE_IOERR_WRITE);
+	if (rc != SQLITE_OK) {
+		for (int i = 0; i < g_group.nparts; i++) g_group.files[i]->group_txnid = 0;
+		g_group.open = 0;
+		pthread_mutex_unlock(&g_group_lock);
+		return rc;
+	}
+
+	// Implicitly committed from here. Resolving moves the heads, and a failure to resolve
+	// is not a failure to commit: recovery finishes it.
+	crash_point();
+	(void)txn_resolve_group(txnid, 1);
+
+	for (int i = 0; i < g_group.nparts; i++) g_group.files[i]->group_txnid = 0;
+	g_group.open = 0;
+	pthread_mutex_unlock(&g_group_lock);
+	return SQLITE_OK;
+}
+
+// Move one participant's head, which is what makes its staged pages reachable. This is
+// the resolve-intent step, and it may run more than once and from more than one process,
+// so it must be safe to repeat.
+static int txn_resolve_part(FdbFile *f, uint64_t staged) {
+	if (staged <= f->head) return SQLITE_OK; // already resolved by somebody
+
+	struct flush_ctx c = {f, staged, 0, f->ndirty};
+	int rc = run_txn(head_body, &c, 1, SQLITE_IOERR_WRITE);
+	if (rc != SQLITE_OK) return rc;
+
+	f->head = staged;
+	f->sent_size = f->size;
+	f->log_pages += (uint64_t)f->ndirty;
+	clear_dirty(f);
+	return SQLITE_OK;
+}
+
+struct status_ctx {
+	uint64_t txnid;
+	uint8_t status;
+};
+
+static fdb_error_t set_status_body(FDBTransaction *tr, void *ctx, int *final) {
+	(void)final;
+	struct status_ctx *c = ctx;
+	uint8_t key[KEYMAX];
+	int klen = key_txn_status(key, c->txnid);
+	fdb_transaction_set(tr, key, klen, &c->status, 1);
+	return 0;
+}
+
+static fdb_error_t drop_record_body(FDBTransaction *tr, void *ctx, int *final) {
+	(void)final;
+	struct status_ctx *c = ctx;
+	uint8_t from[KEYMAX], to[KEYMAX];
+	int flen = key_txn_prefix(from, c->txnid);
+	int tlen = key_after(to, from, flen);
+	fdb_transaction_clear_range(tr, from, flen, to, tlen);
+	return 0;
+}
+
+// Finish a group this process staged: move every head, then say so explicitly.
+static int txn_resolve_group(uint64_t txnid, int drop_record) {
+	for (int i = 0; i < g_group.nparts; i++) {
+		int rc = txn_resolve_part(g_group.files[i], g_group.txids[i]);
+		if (rc != SQLITE_OK) return rc; // recovery will finish what this did not
+	}
+
+	struct status_ctx c = {txnid, TXN_COMMITTED};
+	int rc = run_txn(set_status_body, &c, 1, SQLITE_IOERR_WRITE);
+	if (rc != SQLITE_OK) return rc;
+
+	// The record has done its work once every head has moved. Keeping it would make the
+	// sweep in recovery grow without bound.
+	return drop_record ? run_txn(drop_record_body, &c, 1, SQLITE_IOERR_WRITE) : SQLITE_OK;
+}
+
+// ── Recovery, which is the preventer process ──────────────────────────────────
+//
+// Anybody may find a staging record, and whoever does must decide it. The committer might
+// be dead, so leaving it alone is not an option: its intents are pages nothing will ever
+// reach and nothing will ever free.
+//
+// The decision is the one in the spec. Query every intent. If all of them are there the
+// group is implicitly committed, and the only honest thing to do is finish it, whatever
+// this process wanted. If any is missing it can never become committed, so prevent it —
+// raise the fence on each participant so a late committer is refused — and abort.
+//
+// Both outcomes are idempotent, so two processes recovering the same record at once reach
+// the same end.
+
+// One participant, read back from the record.
+typedef struct {
+	char name[MAX_NAME];
+	uint64_t txid;
+	uint64_t size;
+} TxnPart;
+
+#define TXN_MAX_RECOVER 64
+
+struct recover_ctx {
+	uint64_t txnid;
+	TxnPart parts[TXN_MAX_PARTS];
+	int nparts;
+	int all_present; // every intent found, so implicitly committed
+};
+
+// Read the participants of one record.
+static fdb_error_t read_parts_body(FDBTransaction *tr, void *ctx, int *final) {
+	(void)final;
+	struct recover_ctx *c = ctx;
+	uint8_t from[KEYMAX], to[KEYMAX];
+
+	c->nparts = 0;
+	int flen = key_txn_part_prefix(from, c->txnid);
+	int tlen = key_after(to, from, flen);
+
+	FDBFuture *f = fdb_transaction_get_range(tr, FDB_KEYSEL_FIRST_GREATER_OR_EQUAL(from, flen),
+	                                         FDB_KEYSEL_FIRST_GREATER_OR_EQUAL(to, tlen), 0, 0,
+	                                         FDB_STREAMING_MODE_WANT_ALL, 0, 0, 0);
+	fdb_error_t err = await(f);
+	if (!err) {
+		const FDBKeyValue *kv;
+		int count;
+		fdb_bool_t more;
+		err = fdb_future_get_keyvalue_array(f, &kv, &count, &more);
+		if (!err) {
+			for (int i = 0; i < count && c->nparts < TXN_MAX_PARTS; i++) {
+				if (kv[i].value_length != 16) continue;
+				TxnPart *p = &c->parts[c->nparts];
+				int n = kv[i].key_length - flen;
+				if (n <= 0 || n >= MAX_NAME) continue;
+				memcpy(p->name, kv[i].key + flen, (size_t)n);
+				p->name[n] = '\0';
+				p->txid = get_be64(kv[i].value);
+				p->size = get_be64(kv[i].value + 8);
+				c->nparts++;
+			}
+		}
+	}
+	fdb_future_destroy(f);
+	return err;
+}
+
+struct intent_ctx {
+	const TxnPart *part;
+	int present;
+	uint64_t head;
+	uint32_t pgno[4096];
+	int npages;
+};
+
+// QueryIntent. A participant staged in one transaction, so its pages are all there or
+// none are, and one row answers it. The page numbers come back too, because resolving
+// needs them to write the index.
+//
+// A participant that wrote nothing staged at its own head, and its intent is trivially
+// present: there is nothing that could be missing.
+static fdb_error_t query_intent_body(FDBTransaction *tr, void *ctx, int *final) {
+	(void)final;
+	struct intent_ctx *c = ctx;
+	uint8_t key[KEYMAX], from[KEYMAX], to[KEYMAX];
+	int got = 0;
+
+	c->present = 0;
+	c->npages = 0;
+
+	int klen = key_meta(key, c->part->name, "HEAD");
+	fdb_error_t err = get_u64(tr, key, klen, &c->head, &got);
+	if (err) return err;
+	if (!got) c->head = 0;
+
+	if (c->part->txid <= c->head) {
+		// Already resolved, or the participant wrote nothing. Either way there is no
+		// intent left to be missing.
+		c->present = 1;
+		return 0;
+	}
+
+	int flen = key_delta_txid(from, c->part->name, c->part->txid);
+	int tlen = key_after(to, from, flen);
+	FDBFuture *f = fdb_transaction_get_range(tr, FDB_KEYSEL_FIRST_GREATER_OR_EQUAL(from, flen),
+	                                         FDB_KEYSEL_FIRST_GREATER_OR_EQUAL(to, tlen), 0, 0,
+	                                         FDB_STREAMING_MODE_WANT_ALL, 0, 0, 0);
+	err = await(f);
+	if (!err) {
+		const FDBKeyValue *kv;
+		int count;
+		fdb_bool_t more;
+		err = fdb_future_get_keyvalue_array(f, &kv, &count, &more);
+		if (!err) {
+			for (int i = 0; i < count && c->npages < 4096; i++) {
+				if (kv[i].key_length < 4) continue;
+				const uint8_t *p = kv[i].key + kv[i].key_length - 4;
+				c->pgno[c->npages++] = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16)
+				                       | ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+			}
+			c->present = count > 0;
+		}
+	}
+	fdb_future_destroy(f);
+	return err;
+}
+
+// Resolve one participant from the record alone: point its index at the staged pages,
+// move its size and its head. This is `put_head` without an FdbFile, because recovery has
+// no open handle to work from.
+static fdb_error_t resolve_body(FDBTransaction *tr, void *ctx, int *final) {
+	(void)final;
+	struct intent_ctx *c = ctx;
+	uint8_t key[KEYMAX];
+
+	if (c->part->txid <= c->head) return 0; // somebody resolved it first
+
+	for (int i = 0; i < c->npages; i++) {
+		int klen = key_pidx(key, c->part->name, c->pgno[i]);
+		set_u64(tr, key, klen, c->part->txid);
+	}
+
+	int klen = key_meta(key, c->part->name, "SIZE");
+	set_u64(tr, key, klen, c->part->size);
+
+	uint64_t logn = 0;
+	int got = 0;
+	klen = key_meta(key, c->part->name, "LOGN");
+	fdb_error_t err = get_u64(tr, key, klen, &logn, &got);
+	if (err) return err;
+	set_u64(tr, key, klen, (got ? logn : 0) + (uint64_t)c->npages);
+
+	klen = key_meta(key, c->part->name, "HEAD");
+	set_u64(tr, key, klen, c->part->txid);
+	return 0;
+}
+
+// Prevent, then abort. Raising the fence is what makes it stick: a committer that comes
+// back to move a head reads the fence inside its own write transaction and is refused, so
+// the group can never become committed after this.
+static fdb_error_t prevent_body(FDBTransaction *tr, void *ctx, int *final) {
+	(void)final;
+	struct intent_ctx *c = ctx;
+	uint8_t key[KEYMAX], from[KEYMAX], to[KEYMAX];
+	uint64_t fence = 0;
+	int got = 0;
+
+	int klen = key_meta(key, c->part->name, "FENCE");
+	fdb_error_t err = get_u64(tr, key, klen, &fence, &got);
+	if (err) return err;
+	set_u64(tr, key, klen, got ? fence + 1 : 1);
+
+	// The staged pages are unreachable now and nothing will ever point at them.
+	int flen = key_delta_txid(from, c->part->name, c->part->txid);
+	int tlen = key_after(to, from, flen);
+	fdb_transaction_clear_range(tr, from, flen, to, tlen);
+	return 0;
+}
+
+// Decide one staging record and carry the decision out.
+static int recover_one(uint64_t txnid) {
+	struct recover_ctx c = {txnid, {{{0}, 0, 0}}, 0, 1};
+	int rc = run_txn(read_parts_body, &c, 0, SQLITE_IOERR_READ);
+	if (rc != SQLITE_OK) return rc;
+	if (c.nparts == 0) {
+		// A record with no participants decides nothing and cannot be committed.
+		struct status_ctx s = {txnid, TXN_ABORTED};
+		return run_txn(drop_record_body, &s, 1, SQLITE_IOERR_WRITE);
+	}
+
+	// Query every intent before changing anything, because the decision depends on all of
+	// them and a partial answer is the one thing that must not drive it.
+	struct intent_ctx intents[TXN_MAX_PARTS];
+	for (int i = 0; i < c.nparts; i++) {
+		intents[i].part = &c.parts[i];
+		rc = run_txn(query_intent_body, &intents[i], 0, SQLITE_IOERR_READ);
+		if (rc != SQLITE_OK) return rc;
+		if (!intents[i].present) c.all_present = 0;
+	}
+
+	if (c.all_present) {
+		// Implicitly committed. Finishing it is not a choice.
+		for (int i = 0; i < c.nparts; i++) {
+			rc = run_txn(resolve_body, &intents[i], 1, SQLITE_IOERR_WRITE);
+			if (rc != SQLITE_OK) return rc;
+		}
+		struct status_ctx s = {txnid, TXN_COMMITTED};
+		rc = run_txn(set_status_body, &s, 1, SQLITE_IOERR_WRITE);
+		if (rc != SQLITE_OK) return rc;
+		return run_txn(drop_record_body, &s, 1, SQLITE_IOERR_WRITE);
+	}
+
+	for (int i = 0; i < c.nparts; i++) {
+		rc = run_txn(prevent_body, &intents[i], 1, SQLITE_IOERR_WRITE);
+		if (rc != SQLITE_OK) return rc;
+	}
+	struct status_ctx s = {txnid, TXN_ABORTED};
+	rc = run_txn(set_status_body, &s, 1, SQLITE_IOERR_WRITE);
+	if (rc != SQLITE_OK) return rc;
+	return run_txn(drop_record_body, &s, 1, SQLITE_IOERR_WRITE);
+}
+
+struct sweep_ctx {
+	uint64_t staging[TXN_MAX_RECOVER];
+	int n;
+};
+
+// Every record still in the staging state. `weft/txn/NEXT` sorts under the same prefix and
+// is not a record, so it is skipped by shape: a record's key carries an 8 byte txid.
+static fdb_error_t sweep_body(FDBTransaction *tr, void *ctx, int *final) {
+	(void)final;
+	struct sweep_ctx *c = ctx;
+	uint8_t from[KEYMAX], to[KEYMAX];
+
+	c->n = 0;
+	int flen = key_txn_all(from);
+	int tlen = key_after(to, from, flen);
+
+	FDBFuture *f = fdb_transaction_get_range(tr, FDB_KEYSEL_FIRST_GREATER_OR_EQUAL(from, flen),
+	                                         FDB_KEYSEL_FIRST_GREATER_OR_EQUAL(to, tlen), 0, 0,
+	                                         FDB_STREAMING_MODE_WANT_ALL, 0, 0, 0);
+	fdb_error_t err = await(f);
+	if (!err) {
+		const FDBKeyValue *kv;
+		int count;
+		fdb_bool_t more;
+		err = fdb_future_get_keyvalue_array(f, &kv, &count, &more);
+		if (!err) {
+			const int suffix = 7; // "/STATUS"
+			for (int i = 0; i < count && c->n < TXN_MAX_RECOVER; i++) {
+				if (kv[i].key_length != flen + 8 + suffix) continue;
+				if (memcmp(kv[i].key + flen + 8, "/STATUS", (size_t)suffix) != 0) continue;
+				if (kv[i].value_length != 1 || kv[i].value[0] != TXN_STAGING) continue;
+				c->staging[c->n++] = get_be64(kv[i].key + flen);
+			}
+		}
+	}
+	fdb_future_destroy(f);
+	return err;
+}
+
+// Decide every staging record. Call it before opening any database: opening raises a
+// fence, and a fence raised under a group that was implicitly committed would prevent a
+// commit that already happened.
+int weft_txn_recover(void) {
+	for (;;) {
+		struct sweep_ctx c = {{0}, 0};
+		int rc = run_txn(sweep_body, &c, 0, SQLITE_IOERR_READ);
+		if (rc != SQLITE_OK) return rc;
+		if (c.n == 0) return SQLITE_OK;
+
+		for (int i = 0; i < c.n; i++) {
+			rc = recover_one(c.staging[i]);
+			if (rc != SQLITE_OK) return rc;
+		}
+		// A full sweep may have been truncated, so go round again until one comes back
+		// empty. Each pass strictly removes records, so this ends.
+		if (c.n < TXN_MAX_RECOVER) return SQLITE_OK;
+	}
+}
+
 // ── The rest of the file methods ──────────────────────────────────────────────
 
 static int fdb_truncate(sqlite3_file *file, sqlite3_int64 size) {
@@ -998,6 +1591,12 @@ static const sqlite3_io_methods FDB_IO = {
 	1, fdb_close, fdb_read, fdb_write, fdb_truncate, fdb_sync, fdb_file_size,
 	fdb_lock, fdb_unlock, fdb_check_lock, fdb_control, fdb_sector, fdb_devchar,
 };
+
+// The method table is the identity of the VFS, so comparing against it is how a file is
+// known to be one of ours. Declared above, where the group commit needs it.
+static int is_fdb_file(const sqlite3_file *file) {
+	return file && file->pMethods == &FDB_IO;
+}
 
 // ── The VFS ───────────────────────────────────────────────────────────────────
 
