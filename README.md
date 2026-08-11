@@ -1,14 +1,9 @@
 # fabric-store-plane
 
-Split out of [`weft`](https://github.com/v-sekai-multiplayer-fabric/weft) with its
-history. weft keeps only the data plane and the NIF the BEAM loads. A plane is its own
-process, its own repository, and its own container.
-
 `thirdparty/harness` is
 [`fabric-harness`](https://github.com/v-sekai-multiplayer-fabric/fabric-harness), pulled
 in as a subtree. It carries the iceoryx2 C ABI and the shared limits, and this plane links
 it rather than linking iceoryx2.
-
 
 Goal: the store plane is a native process. SQLite runs inside it with a custom VFS, and
 that VFS reads and writes pages in FoundationDB. The BEAM reaches the plane over Eclipse
