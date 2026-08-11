@@ -24,6 +24,15 @@ first, and issue 43 is about a soak that reported a count and discarded which on
 The oracle runs a real process against a real FoundationDB, so it is `IO` behind a pure
 face. Every probe is memoized, which bounds the whole search at one process for each
 crash point however many times plausible samples it.
+
+## What it found
+
+Against the layout that committed each `xWrite` on its own, the search finds a witness at
+the first rung. Against the layout `fdb_vfs.c` holds now, where a commit is one
+transaction, it covers the space and finds none.
+
+How many candidates each run covered is in weft's `docs/logbook/store_plane.md`, and not
+here, because a count that lives in two places goes stale in one of them.
 -/
 
 open PlausibleWitnessDag

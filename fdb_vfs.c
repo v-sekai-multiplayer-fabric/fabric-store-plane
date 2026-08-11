@@ -4,6 +4,19 @@
 // local file, so an actor's database moves between machines with no copy and no restore
 // step.
 //
+// Why a VFS and not a key and value table. A VFS gives SQLite its pages one page at a
+// time, so SQLite reads the pages a query touches and no others. Three things follow, and
+// none of them is true of the Elixir prototype this replaces:
+//
+//   - An actor is not limited by memory. The working set is in memory and the rest is in
+//     FoundationDB, which is what makes the 10 GiB limit in `Weft.Limits` possible.
+//   - A handoff copies nothing. A different machine opens the same database and reads
+//     pages. There is no restore step and no transfer, so a large actor moves as fast as
+//     a small one. `prove_handoff.c` is that property on its own.
+//   - Compaction is not weft's to get wrong. The prototype's replicator folds a log by
+//     hand and has a race. The layout below moves that work into one place with one
+//     owner, and `Store.lean` proves the rule the fold must obey.
+//
 // Layout. rivet's Depot layout, modelled in docs/spec/Store.lean:
 //
 //   weft/db/<name>/HEAD                 the txid of the newest commit
@@ -28,8 +41,17 @@
 // crash loses the last few commits. Leaving pages from two commits is a different
 // failure, because a reader cannot see it and it loses the whole actor.
 //
-// The journal must stay in memory. Set `PRAGMA journal_mode=MEMORY`. The commit above is
-// atomic, so a rollback journal on disk adds cost and protects nothing.
+// What a caller must set. Two pragmas, and neither is a tuning knob.
+//
+// `PRAGMA journal_mode=MEMORY`. The commit above is atomic, so a rollback journal on disk
+// adds cost and protects nothing.
+//
+// `PRAGMA locking_mode=EXCLUSIVE`. Without it SQLite reads page 1 to check the change
+// counter at the start of every read transaction, and over a database on the network that
+// check is a round trip for every query. The pragma tells SQLite that nothing else can
+// change the file, so it trusts its page cache and stops the re-read. An actor is the
+// single writer of its own store, so the statement is true. It was worth more than the
+// layout of the pages; weft's `docs/logbook/store_plane.md` holds the number.
 //
 // Every transaction runs in the retry loop that FoundationDB documents.
 // `fdb_transaction_on_error` decides if an error may be retried, and waits before the

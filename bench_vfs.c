@@ -6,6 +6,21 @@
 // through the FoundationDB VFS, and prints operations for each second. The local file
 // is the floor, not the target: it is one machine with no durability across machines.
 // The number that matters is the ratio, and where the ratio comes from.
+//
+// Three results shape the design. Every number, and the cluster and the settings that
+// produced it, is in weft's `docs/logbook/store_plane.md`.
+//
+//   - A read costs what a local read costs. Point reads and a scan both land within 1.1
+//     times of SQLite on a local file, because the page cache absorbs them and no round
+//     trip happens.
+//   - A write pays for the network, and that is the trade the design takes. A commit is a
+//     round trip of about 1.1 ms whatever it carries, so the payload is nearly free until
+//     it is large.
+//   - Commits in flight are worth 44 times, and more database handles are worth nothing.
+//     One client process has one network thread and every handle shares it, and one
+//     database cannot pipeline its own commits because SQLite waits inside `xSync`. So
+//     the depth comes from the number of actors that commit at once, which is what
+//     iceoryx is for.
 
 #define _POSIX_C_SOURCE 200809L
 

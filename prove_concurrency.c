@@ -10,8 +10,33 @@
 // availability, so during a partition each side may briefly run its own instance. This
 // program runs that case on purpose, so the result is measured rather than assumed.
 //
-// rivet handles it with a fence. `depot_client_types::is_head_fence_mismatch` rejects a
-// writer whose head token is stale. This VFS has no fence yet.
+// Two writers lost data, silently. Before the fence, run with two writers on one
+// database:
+//
+//   writer 1: wrote 300, refused 0
+//   writer 2: wrote 300, refused 0
+//   integrity_check: ok
+//
+// Both reported success and `PRAGMA integrity_check` passed. Every row belonged to writer
+// 2, and writer 1's 300 rows were gone. Silent loss, no error, and a database that checks
+// out as healthy. That is the failure this program exists to catch, and it is why the
+// suite does not stop at integrity_check.
+//
+// The fence is the answer, and `fdb_vfs.c` has it now. Opening a database raises a
+// number, and a writer holding an older one is refused. rivet does the same, in
+// `depot_client_types::is_head_fence_mismatch`. With the fence:
+//
+//   writer 1: wrote 200, refused 0
+//   writer 2: wrote 0, refused 200
+//
+// The loss became a loud failure. That is the whole point: a store may refuse a write,
+// and it may not accept a write and drop it.
+//
+// The fence guards every write transaction and not only the commit. The first version
+// checked it in the commit alone, so a stale writer could still compact. Compaction drops
+// the shard version the owner is reading, the owner then read pages that were gone, and
+// both writers failed against a database that was intact. A fence that covers one write
+// path and not the others is not a fence. See `check_fence` in `fdb_vfs.c`.
 
 #define _POSIX_C_SOURCE 200809L
 

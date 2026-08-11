@@ -1,13 +1,8 @@
 # fabric-store-plane
 
-`thirdparty/harness` is
-[`fabric-harness`](https://github.com/v-sekai-multiplayer-fabric/fabric-harness), pulled
-in as a subtree. It carries the iceoryx2 C ABI and the shared limits, and this plane links
-it rather than linking iceoryx2.
-
-Goal: the store plane is a native process. SQLite runs inside it with a custom VFS, and
-that VFS reads and writes pages in FoundationDB. The BEAM reaches the plane over Eclipse
-iceoryx2. The plane reaches FoundationDB with the native client, `libfdb_c`.
+The store plane is a native process. SQLite runs inside it with a custom VFS, and that VFS
+reads and writes pages in FoundationDB. The BEAM reaches the plane over Eclipse iceoryx2.
+The plane reaches FoundationDB with the native client, `libfdb_c`.
 
 ```
 BEAM control plane
@@ -19,47 +14,9 @@ store plane (native)
 FoundationDB
 ```
 
-State: the VFS is built, and it holds the layout below. A commit is one FoundationDB
-transaction. Reads, writes, compaction, and the fence run against a live cluster. The
-plane itself is not built. The bus works, and the loop that sits on it does not.
-`thirdparty/harness` passes a message between two processes over iceoryx2, and its README
-records the run. There is no thread-per-core loop yet, so nothing calls this VFS except
-the programs beside it.
-
-What is not built and what is proposed is in the
-[issues](https://github.com/v-sekai-multiplayer-fabric/fabric-store-plane/issues). This
-file describes what the code does.
-
-## Why a VFS
-
-A VFS gives SQLite its pages one page at a time. So SQLite reads the pages a query
-touches and no others. Three things follow, and none of them is true of the prototype.
-
-- **An actor is not limited by memory.** The working set is in memory, and the rest is in
-  FoundationDB. This is what makes the 10 GiB limit in `Weft.Limits` possible.
-- **A handoff copies nothing.** A different machine opens the same database and reads
-  pages. There is no restore step and no transfer, so a large actor moves as fast as a
-  small one.
-- **Compaction is not weft's to get wrong.** The Elixir replicator folds a log by hand,
-  and it has a race. weft's `docs/spec/Store.lean` proves the rule the fold must obey. The page
-  layout moves that work into one place with one owner.
-
-## The layout
-
-rivet's Depot layout, modelled in weft's `docs/spec/Store.lean`:
-
-- `PIDX/{pgno}` gives the txid that owns a page, so a read never scans the log.
-- `DELTA/{txid}/{chunk}` holds the pages of one commit.
-- `SHARD/{shard}/{as_of_txid}` holds a compacted base, versioned. Compaction adds a
-  version and never overwrites one.
-
-weft's `docs/spec/Store.lean` proves that compaction preserves every read, that the in-place fold
-loses a page, and that a read touches two rows whatever the log holds.
-
-## What is built
-
-`fdb_vfs.c` is a SQLite VFS whose files live in FoundationDB, and `prove_handoff.c`
-proves the property the decision rests on.
+There is no local file, so an actor's database moves between machines with no copy and no
+restore step. That is the property the whole design rests on, and `prove_handoff.c` is it
+on its own:
 
 ```
 === process A: write ===
@@ -72,166 +29,78 @@ ls: cannot access 'zone-atlantis.db': No such file or directory
 read 3 rows from zone-atlantis.db in a new process, nothing was copied
 ```
 
-SQLite wrote the rows through the VFS, no file exists on the disk, and a different
-process read them. A handoff copies nothing because there is nothing to copy.
+`thirdparty/harness` is
+[`fabric-harness`](https://github.com/v-sekai-multiplayer-fabric/fabric-harness), pulled
+in as a subtree. It carries the iceoryx2 C ABI and the shared limits, and this plane links
+it rather than linking iceoryx2.
 
-The layout is the one above, and the keys are these:
+## State
 
-```
-weft/db/<name>/HEAD                 the txid of the newest commit
-weft/db/<name>/SIZE                 the file size
-weft/db/<name>/FENCE                the ownership fence
-weft/db/<name>/PIDX/<pgno>          the txid that owns a page
-weft/db/<name>/DELTA/<txid>/<pgno>  the pages of one commit
-weft/db/<name>/SHARD/<as_of>/<pgno> a compacted base, versioned
-weft/db/<name>/SHARDN/<as_of>       the page count of a shard version
-weft/db/<name>/LOGN                 the page count of the log since compaction
-weft/db/<name>/PIN/<txid>           a read that holds a shard version
-```
+The VFS is built. A commit is one FoundationDB transaction, and reads, writes, compaction,
+and the fence run against a live cluster.
 
-A read finds the owner in PIDX and then reads one of DELTA or SHARD. So a read touches
-two rows whatever the log holds. weft's `docs/spec/Store.lean` proves this as
-`read_touches_two_rows`.
+The plane itself is not built. The bus works and the loop that sits on it does not, so
+nothing calls this VFS except the programs beside it.
 
-### A commit is one transaction
-
-The VFS holds the pages SQLite writes in memory. It sends them when SQLite syncs the
-file, which is the end of a commit. So the pages of one commit reach FoundationDB
-together. A crash leaves the whole commit, or it leaves none of it.
-
-A commit that fits one transaction is one transaction. That is the common case, and it
-costs one round trip.
-
-A commit too large for one transaction stages instead. The pages go first, under a txid
-that no read can reach, and one more transaction then moves the head. This is the shape
-CockroachDB calls a parallel commit. The staged pages are safe to leave behind, because
-the next open clears every txid above the head.
-
-### Compaction
-
-Compaction folds the log into a new shard version. It adds a version and never
-overwrites one. It clears a PIDX row only when that row points at a folded txid.
-weft's `docs/spec/Store.lean` proves that these two rules preserve every read.
-
-The trigger is a ratio and not a number. Compaction runs when the log is as large as the
-base. A ratio has no units to tune, and it moves with the load. A quiet actor never
-compacts.
-
-Retention follows demand. A shard version below the oldest pin is one that nobody can
-read, so compaction drops it. Nothing writes a pin, so only the newest version survives
-(#2).
-
-Locking is a no-op, because an actor is the single writer of its own store.
-
-## Measured
-
-Every number, and the cluster and the settings that produced it, is in
-weft's `weft's docs/logbook/store_plane.md`. Three results shape the design.
-
-A read costs what a local read costs. Point reads and a scan both land within 1.1 times of
-SQLite on a local file, because the page cache absorbs them and no round trip happens.
-
-A write pays for the network, and that is the trade the design takes. A commit is a round
-trip of about 1.1 ms whatever it carries, so the payload is nearly free until it is large.
-
-Commits in flight are worth 44 times, and more database handles are worth nothing. One
-client process has one network thread, and every handle shares it. One database cannot
-pipeline its own commits, because SQLite waits inside `xSync`. So the depth comes from the
-number of actors that commit at once, which is what iceoryx is for.
-
-### Set the locking mode
-
-`PRAGMA locking_mode=EXCLUSIVE` is not optional here. Without it SQLite reads page 1 to
-check the change counter at the start of every read transaction, and over a database on
-the network that check is a round trip for every query.
-
-The pragma tells SQLite that nothing else can change the file, so it trusts its page cache
-and stops the re-read. An actor is the single writer of its own store, so the statement is
-true. weft's `weft's docs/logbook/store_plane.md` holds what it was worth, which was more than the layout of
-the pages.
-
-## Two writers lost data, silently
-
-The locks in the VFS are no-ops, so two writers both believe they hold the write lock.
-Run with two writers on one database, before the fence:
-
-```
-writer 1: wrote 300, refused 0
-writer 2: wrote 300, refused 0
-integrity_check: ok
-```
-
-Both reported success. `PRAGMA integrity_check` passed. Every row belonged to writer 2,
-and writer 1's 300 rows were gone. Silent loss, no error, and a database that checks out
-as healthy.
-
-This matters because the single-writer invariant is not absolute. `Weft.Actors` says
-Horde is CRDT-based and chooses availability, so during a partition each side may
-briefly run its own instance.
-
-### The fence
-
-Opening a database raises a number, and a writer that holds an older number is refused.
-The fence is read inside the write transaction, so FoundationDB rejects the commit if
-the fence moved. rivet does the same, in `depot_client_types::is_head_fence_mismatch`.
-
-With the fence:
-
-```
-writer 1: wrote 200, refused 0
-writer 2: wrote 0, refused 200
-```
-
-The loss became a loud failure. That is the whole point: a store may refuse a write, and
-it may not accept a write and drop it.
-
-The fence guards every write transaction, and not only the commit. The first version
-checked it in the commit alone, so a stale writer could still compact. Compaction drops
-the shard version that the owner reads. The owner then read pages that were gone, and both
-writers failed against a database that was intact. A fence that covers one write path and
-not the others is not a fence.
-
-## A crash point is a better test than a delay
-
-`prove_crash` crashes a writer and then looks for a database that holds half of a commit.
-`PRAGMA integrity_check` cannot see that fault, because a database that mixes pages from
-two commits is structurally valid. So the program checks the contents directly: every
-round writes the same text into every row, and two distinct values mean a torn commit.
-
-It crashes in two ways. `kill` sends SIGKILL after a delay, which is the crash a machine
-gives. `at` stops the writer before a numbered commit. The second repeats exactly, and a
-search cannot address a failure it cannot repeat.
-
-`witness/` searches the crash points with [plausible-witness-dag][pwd]. A candidate names
-a commit size and a crash point. plausible samples the space at each rung of a ladder, and
-a deterministic walk then covers it in order. The two negatives differ, and the difference
-is the point: a budget hit means the search did not look everywhere, and `provablyNone`
-means it did.
-
-[pwd]: https://github.com/fire/plausible-witness-dag
-
-Against the layout that committed each `xWrite` on its own, the search finds a witness at
-the first rung. Against the layout above, it covers the space and finds none.
-weft's `weft's docs/logbook/store_plane.md` holds how many candidates each run covered, because a count that
-lives in two places goes stale in one of them.
-
-## Every transaction retries
-
-FoundationDB expects a client to retry. `fdb_transaction_on_error` decides whether an
-error may be retried, and it waits the right amount before the next attempt. Every
-transaction in the VFS runs in that loop.
-
-This matters for two errors that arrive with load rather than with a bug. Error 1020,
-`not_committed`, means the transaction conflicted. Error 1007, `transaction_too_old`,
-ends a read that ran past the five second limit. Both were hard failures before, and
-both now retry.
-
-A fence mismatch does not retry. Refusing the write is the correct answer, so it reaches
-the caller as `SQLITE_READONLY`.
-
-## Open work
-
-Every proposal and everything unbuilt lives in the
+Everything proposed and everything unbuilt is in the
 [issues](https://github.com/v-sekai-multiplayer-fabric/fabric-store-plane/issues):
-read-ahead, pins, the index bound on a very large commit, many writers committing at
-once, the plane process itself, and deleting the Elixir prototype it replaces.
+read-ahead, pins, the index bound on a very large commit, many writers committing at once,
+the plane process itself, and deleting the Elixir prototype it replaces.
+
+## Where the design is written down
+
+Every rule sits beside the code it governs, so this file does not repeat it.
+
+| what | where |
+| --- | --- |
+| the key layout, and why a read touches two rows | `fdb_vfs.c`, the file comment |
+| what a caller must set, and why | `fdb_vfs.c`, the file comment |
+| the commit protocol, and the staging path a large commit takes | `flush` in `fdb_vfs.c` |
+| the compaction rules and the ratio that triggers them | the compaction section of `fdb_vfs.c` |
+| the fence, and what two writers did without one | `prove_concurrency.c`, and `check_fence` |
+| why a crash point beats a delay | `prove_crash.c` |
+| what the crash search covers, and what it found | `witness/CrashSearch.lean` |
+| the measured numbers, and what they mean for the design | `bench_vfs.c` |
+| the retry loop every transaction runs in | `run_txn` in `fdb_vfs.c` |
+
+The proofs are weft's. `docs/spec/Store.lean` holds the layout and the compaction rules,
+`docs/spec/Prefetch.lean` holds read-ahead, and `docs/logbook/store_plane.md` holds every
+measured number with the cluster and the settings that produced it.
+
+## Build
+
+The build needs the FoundationDB client and SQLite headers.
+
+```
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+```
+
+The `Containerfile` carries both, and is the reproducible path:
+
+```
+podman build -t fabric-store-plane .
+```
+
+## Run
+
+Every program takes the cluster file from `WEFT_FDB_CLUSTER_FILE` and needs a live
+FoundationDB.
+
+```
+export WEFT_FDB_CLUSTER_FILE=/etc/foundationdb/fdb.cluster
+
+./build/prove_handoff write zone-atlantis.db   # then read, in a new process
+./build/prove_crash crash.db 400 at 7          # crash before the 7th commit
+./build/prove_concurrency one.db 1 300         # two writers, one database
+./build/prove_big_commit big.db 2000 8192      # a commit past one transaction
+./build/integrity zone-atlantis.db             # SQLite's own audit
+./build/bench_vfs 1000                         # against a local file
+```
+
+`soak.sh` runs the load, kill, and crash rounds in turn, and reports which round failed
+and what it printed rather than a count. Point `BIN` at the build directory:
+
+```
+BIN=build ./soak.sh 3600
+```
