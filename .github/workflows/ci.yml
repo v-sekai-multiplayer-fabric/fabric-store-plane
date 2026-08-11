@@ -1,0 +1,132 @@
+# Build the store plane and run the programs that assert something.
+#
+# Two jobs, because they need different things. `test` needs a live FoundationDB, since
+# every program here is a program about a database. `fuzz` needs neither FoundationDB nor
+# SQLite: `fdb_keys.h` is pure, which is why it was split out.
+name: ci
+
+on:
+  pull_request:
+  merge_group:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      FDB_VERSION: "7.3.76"
+      WEFT_FDB_CLUSTER_FILE: /etc/foundationdb/fdb.cluster
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: cache FoundationDB packages
+        uses: actions/cache@v6
+        with:
+          path: ~/fdb-debs
+          key: fdb-debs-${{ env.FDB_VERSION }}
+
+      - name: Install FoundationDB
+        run: |
+          mkdir -p ~/fdb-debs
+          [ -f ~/fdb-debs/clients.deb ] || curl -fsSL -o ~/fdb-debs/clients.deb \
+            "https://github.com/apple/foundationdb/releases/download/${FDB_VERSION}/foundationdb-clients_${FDB_VERSION}-1_amd64.deb"
+          [ -f ~/fdb-debs/server.deb ] || curl -fsSL -o ~/fdb-debs/server.deb \
+            "https://github.com/apple/foundationdb/releases/download/${FDB_VERSION}/foundationdb-server_${FDB_VERSION}-1_amd64.deb"
+          sudo dpkg -i ~/fdb-debs/clients.deb ~/fdb-debs/server.deb
+          # The server package's postinst starts a single-node cluster. Wait for it.
+          for i in $(seq 1 30); do
+            fdbcli --exec 'status minimal' | grep -q 'The database is available' && break
+            sleep 2
+          done
+          fdbcli --exec 'status minimal'
+
+      - name: Install SQLite headers
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libsqlite3-dev
+
+      - name: Build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          cmake --build build -j
+
+      # A handoff copies nothing. The reader is a different process with no local file, so
+      # this fails if the VFS ever writes one.
+      - name: A handoff copies nothing
+        run: |
+          ./build/prove_handoff write zone-atlantis.db
+          test ! -f zone-atlantis.db || { echo "a local file appeared"; exit 1; }
+          ./build/prove_handoff read zone-atlantis.db
+
+      # SQLite's own audit of its B-tree, over a database that lives in FoundationDB.
+      - name: SQLite checks its own pages
+        run: ./build/integrity zone-atlantis.db
+
+      # The only program that reaches the staging path, where a commit is too large for
+      # one transaction.
+      - name: A commit past one transaction
+        run: ./build/prove_big_commit big.db 2000 8192
+
+      # A crash must leave the whole commit or none of it. Walk crash points rather than
+      # one, since the fault lives at a particular point and a single delay rarely lands
+      # inside a commit. The full space is the Lean search in witness/, too long for a
+      # pull request.
+      #
+      # The points start past the setup. A writer drops the table, creates it, and seeds
+      # it before the first round, so a crash below about commit 6 lands in setup and
+      # leaves a database with no rows, where nothing can be torn. Points 1 to 5 passed
+      # here and tested nothing, so the step now starts above them and fails if it never
+      # reaches a seeded database. A green step that asserted nothing is the failure this
+      # suite exists to avoid.
+      - name: A crash leaves no torn commit
+        run: |
+          seeded=0
+          for point in 6 8 10 13 16 21; do
+            echo "=== crash before commit $point ==="
+            # Exit 2 means the crash point was past the end of the sequence, which is not
+            # a fault, so the status has to be captured rather than left to abort the step.
+            rc=0
+            out=$(./build/prove_crash "crash-$point.db" 400 at "$point" 2>&1) || rc=$?
+            echo "$out"
+            # 0 whole, 2 unreached, 1 torn or a failed integrity check.
+            if [ "$rc" = 1 ]; then echo "torn at crash point $point"; exit 1; fi
+            case "$out" in *"rows: 0"*) ;; *"rows: "*) seeded=$((seeded + 1)) ;; esac
+          done
+          echo "crash points that reached a seeded database: $seeded"
+          if [ "$seeded" = 0 ]; then
+            echo "every crash point landed in setup, so this step asserted nothing"
+            exit 1
+          fi
+
+  fuzz:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      # FuzzTest wants a recent Clang, and coverage-guided mode needs one.
+      - name: Install Clang
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang lld
+
+      - name: cache the FuzzTest build
+        uses: actions/cache@v6
+        with:
+          path: build-fuzz/_deps
+          key: fuzztest-${{ hashFiles('fuzz/CMakeLists.txt') }}
+
+      - name: Build the fuzz tests
+        env:
+          CC: clang
+          CXX: clang++
+        run: |
+          cmake -S fuzz -B build-fuzz -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          cmake --build build-fuzz -j
+
+      # Unit-test mode: every property runs against random inputs for a short budget. This
+      # gates a pull request. Hunting for a counterexample over hours is a separate run.
+      - name: Check the key properties
+        run: ctest --test-dir build-fuzz --output-on-failure

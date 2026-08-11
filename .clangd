@@ -31,4 +31,18 @@ CompileFlags:
     - -I.deps
     - -I/usr/include/foundationdb
     - -DFDB_API_VERSION=730
+---
+# The C flags above must not reach the fuzz tests, which are C++. `fuzz/` has its own
+# build and its own standard, and -std=c11 on a .cc file is an error rather than a guess.
+If:
+  PathMatch: .*\.(c|h)
+CompileFlags:
+  Add:
     - -std=c11
+---
+If:
+  PathMatch: fuzz/.*\.cc
+CompileFlags:
+  Add:
+    - -std=c++17
+    - -I.

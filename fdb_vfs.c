@@ -76,6 +76,8 @@
 
 #define _POSIX_C_SOURCE 200809L
 
+#include "fdb_keys.h"
+
 #include <fdb_c.h>
 #include <pthread.h>
 #include <sqlite3.h>
@@ -88,7 +90,6 @@
 // SQLite's page size. This is not a choice.
 #define PAGE 4096
 #define MAX_NAME 512
-#define KEYMAX 640
 
 // FoundationDB caps a value and a transaction. These are not choices either. Every
 // limit below comes from them, so there is no constant to tune. See `Store.lean`.
@@ -169,78 +170,10 @@ static fdb_error_t await(FDBFuture *f) {
 
 // ── Keys ──────────────────────────────────────────────────────────────────────
 //
-// A number goes into a key big endian, so the order of the keys is the order of the
-// numbers. A range read then gives pages and commits in order.
-
-static void put_be32(uint8_t *out, uint32_t v) {
-	for (int i = 0; i < 4; i++) out[i] = (uint8_t)(v >> (24 - 8 * i));
-}
-
-static void put_be64(uint8_t *out, uint64_t v) {
-	for (int i = 0; i < 8; i++) out[i] = (uint8_t)(v >> (56 - 8 * i));
-}
-
-static uint64_t get_be64(const uint8_t *in) {
-	uint64_t v = 0;
-	for (int i = 0; i < 8; i++) v = (v << 8) | in[i];
-	return v;
-}
-
-static int key_meta(uint8_t *out, const char *name, const char *what) {
-	return snprintf((char *)out, KEYMAX, "weft/db/%s/%s", name, what);
-}
-
-static int key_pidx(uint8_t *out, const char *name, uint32_t pgno) {
-	int n = snprintf((char *)out, KEYMAX, "weft/db/%s/PIDX/", name);
-	put_be32(out + n, pgno);
-	return n + 4;
-}
-
-static int key_delta(uint8_t *out, const char *name, uint64_t txid, uint32_t pgno) {
-	int n = snprintf((char *)out, KEYMAX, "weft/db/%s/DELTA/", name);
-	put_be64(out + n, txid);
-	put_be32(out + n + 8, pgno);
-	return n + 12;
-}
-
-static int key_delta_txid(uint8_t *out, const char *name, uint64_t txid) {
-	int n = snprintf((char *)out, KEYMAX, "weft/db/%s/DELTA/", name);
-	put_be64(out + n, txid);
-	return n + 8;
-}
-
-static int key_shard(uint8_t *out, const char *name, uint64_t as_of, uint32_t pgno) {
-	int n = snprintf((char *)out, KEYMAX, "weft/db/%s/SHARD/", name);
-	put_be64(out + n, as_of);
-	put_be32(out + n + 8, pgno);
-	return n + 12;
-}
-
-static int key_shard_version(uint8_t *out, const char *name, uint64_t as_of) {
-	int n = snprintf((char *)out, KEYMAX, "weft/db/%s/SHARD/", name);
-	put_be64(out + n, as_of);
-	return n + 8;
-}
-
-static int key_shardn(uint8_t *out, const char *name, uint64_t as_of) {
-	int n = snprintf((char *)out, KEYMAX, "weft/db/%s/SHARDN/", name);
-	put_be64(out + n, as_of);
-	return n + 8;
-}
-
-static int key_prefix(uint8_t *out, const char *name, const char *what) {
-	return snprintf((char *)out, KEYMAX, "weft/db/%s/%s/", name, what);
-}
-
-// The first key after every key with this prefix. FoundationDB calls it strinc. A range
-// from a prefix to this covers exactly the keys under that prefix.
-static int key_after(uint8_t *out, const uint8_t *prefix, int plen) {
-	if (out != prefix) memcpy(out, prefix, (size_t)plen);
-	int n = plen;
-	while (n > 0 && out[n - 1] == 0xFF) n--;
-	if (n > 0) out[n - 1]++;
-	return n;
-}
+// In `fdb_keys.h`, because they depend on neither FoundationDB nor SQLite and
+// `fuzz/keys_test.cc` tests them without either. A number goes into a key big endian, so
+// the order of the keys is the order of the numbers, and a range read then gives pages
+// and commits in order.
 
 // ── The transaction runner ────────────────────────────────────────────────────
 
