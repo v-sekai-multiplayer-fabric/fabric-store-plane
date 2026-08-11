@@ -71,6 +71,27 @@ jobs:
       - name: A commit past one transaction
         run: ./build/prove_big_commit big.db 2000 8192
 
+      # A grant across two databases lands whole or not at all. This is the parallel commit
+      # protocol: the crash points that matter are between staging the intents and writing
+      # the record, where the group must abort, and between the record and moving the heads,
+      # where it is already implicitly committed and recovery must finish it. Conservation
+      # is the oracle, since integrity_check cannot see two databases disagreeing.
+      - name: A grant is never partial
+        run: |
+          granted=0
+          for point in 3 4 5 6 7 9 12; do
+            echo "=== crash before write transaction $point ==="
+            rc=0
+            ./build/prove_parallel_commit "world-$point.db" "avatar-$point.db" 8 at "$point" || rc=$?
+            if [ "$rc" = 1 ]; then echo "a grant was partial at $point"; exit 1; fi
+            if [ "$rc" = 0 ]; then granted=$((granted + 1)); fi
+          done
+          echo "crash points that reached a decided grant: $granted"
+          if [ "$granted" = 0 ]; then
+            echo "every crash point was out of range, so this step asserted nothing"
+            exit 1
+          fi
+
       # A crash must leave the whole commit or none of it. Walk crash points rather than
       # one, since the fault lives at a particular point and a single delay rarely lands
       # inside a commit. The full space is the Lean search in witness/, too long for a

@@ -83,6 +83,54 @@ static inline int key_prefix(uint8_t *out, const char *name, const char *what) {
 	return snprintf((char *)out, KEYMAX, "weft/db/%s/%s/", name, what);
 }
 
+// ── The transaction record ────────────────────────────────────────────────────
+//
+// A commit that spans several databases cannot be one database's transaction, and
+// `flush` is scoped to one file. So a group of them shares a record, which is what
+// ParallelCommits.tla calls the transaction record:
+//
+//   weft/txn/<txnid>/STATUS        staging, committed, or aborted
+//   weft/txn/<txnid>/PART/<name>   a participant, and the txid it staged under
+//
+// The record lives outside `weft/db/`, because it belongs to no single database. A
+// participant row names a database and the staged txid its pages went under, which is the
+// only thing recovery needs to find them again.
+
+// Status values. They are written as one byte, because the set is closed and a string
+// would invite a fifth state that the state machine does not have.
+#define TXN_STAGING 1
+#define TXN_COMMITTED 2
+#define TXN_ABORTED 3
+
+static inline int key_txn_status(uint8_t *out, uint64_t txnid) {
+	int n = snprintf((char *)out, KEYMAX, "weft/txn/");
+	put_be64(out + n, txnid);
+	return n + 8 + snprintf((char *)out + n + 8, KEYMAX - n - 8, "/STATUS");
+}
+
+static inline int key_txn_part(uint8_t *out, uint64_t txnid, const char *name) {
+	int n = snprintf((char *)out, KEYMAX, "weft/txn/");
+	put_be64(out + n, txnid);
+	return n + 8 + snprintf((char *)out + n + 8, KEYMAX - n - 8, "/PART/%s", name);
+}
+
+static inline int key_txn_part_prefix(uint8_t *out, uint64_t txnid) {
+	int n = snprintf((char *)out, KEYMAX, "weft/txn/");
+	put_be64(out + n, txnid);
+	return n + 8 + snprintf((char *)out + n + 8, KEYMAX - n - 8, "/PART/");
+}
+
+static inline int key_txn_prefix(uint8_t *out, uint64_t txnid) {
+	int n = snprintf((char *)out, KEYMAX, "weft/txn/");
+	put_be64(out + n, txnid);
+	return n + 8;
+}
+
+// Every transaction record, so recovery can sweep for the staging ones.
+static inline int key_txn_all(uint8_t *out) {
+	return snprintf((char *)out, KEYMAX, "weft/txn/");
+}
+
 // The first key after every key with this prefix. FoundationDB calls it strinc. A range
 // from a prefix to this covers exactly the keys under that prefix.
 static inline int key_after(uint8_t *out, const uint8_t *prefix, int plen) {

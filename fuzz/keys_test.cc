@@ -162,6 +162,56 @@ void KeyAfterIsTheSameInPlace(const std::vector<uint8_t>& prefix) {
 }
 FUZZ_TEST(KeysTest, KeyAfterIsTheSameInPlace);
 
+// ── The transaction record ────────────────────────────────────────────────────
+
+// Recovery sweeps `weft/txn/` and picks records out by shape: a record's key carries an 8
+// byte txid where `weft/txn/NEXT` carries a name. If a txid could ever produce the bytes
+// of that counter key, the sweep would try to recover the counter.
+void TheTxnCounterIsNeverMistakenForARecord(uint64_t txnid) {
+	uint8_t status[KEYMAX];
+	const int n = key_txn_status(status, txnid);
+
+	uint8_t all[KEYMAX];
+	const int prefix = key_txn_all(all);
+
+	// The sweep's test, transcribed: a record key is the prefix, 8 bytes, then "/STATUS".
+	ASSERT_GT(n, prefix + 8);
+	EXPECT_EQ(0, memcmp(status, all, static_cast<size_t>(prefix)));
+	EXPECT_EQ(0, memcmp(status + prefix + 8, "/STATUS", 7));
+	EXPECT_EQ(n, prefix + 8 + 7);
+}
+FUZZ_TEST(KeysTest, TheTxnCounterIsNeverMistakenForARecord);
+
+// A record sorts by its txid, so the sweep reads them in the order they were begun.
+void TxnRecordsSortByTxid(uint64_t a, uint64_t b) {
+	uint8_t ka[KEYMAX], kb[KEYMAX];
+	const int na = key_txn_status(ka, a);
+	const int nb = key_txn_status(kb, b);
+	std::string sa(reinterpret_cast<char*>(ka), static_cast<size_t>(na));
+	std::string sb(reinterpret_cast<char*>(kb), static_cast<size_t>(nb));
+	if (a < b) {
+		EXPECT_LT(sa, sb);
+	} else if (a > b) {
+		EXPECT_GT(sa, sb);
+	} else {
+		EXPECT_EQ(sa, sb);
+	}
+}
+FUZZ_TEST(KeysTest, TxnRecordsSortByTxid);
+
+// A participant row must stay under its own record, or recovery would read one group's
+// participants as another's.
+void TxnPartsStayUnderTheirRecord(uint64_t txnid, const std::string& name) {
+	if (name.size() > 64) return;
+	uint8_t part[KEYMAX], prefix[KEYMAX];
+	const int n = key_txn_part(part, txnid, name.c_str());
+	const int p = key_txn_part_prefix(prefix, txnid);
+	ASSERT_GE(n, p);
+	EXPECT_EQ(0, memcmp(part, prefix, static_cast<size_t>(p)));
+}
+FUZZ_TEST(KeysTest, TxnPartsStayUnderTheirRecord)
+    .WithDomains(fuzztest::Arbitrary<uint64_t>(), AnyName());
+
 // ── A key stays inside the buffer ─────────────────────────────────────────────
 
 // Every builder writes into a KEYMAX buffer. A name long enough to fill it must not carry
