@@ -43,7 +43,7 @@ int weft_fdb_start(const char *cluster_file);
 void weft_fdb_stop(void);
 int weft_vfs_register(int make_default);
 int weft_txn_begin(unsigned long long *txnid);
-int weft_txn_stage(sqlite3 *db, unsigned long long txnid);
+int weft_txn_join(sqlite3 *db, unsigned long long txnid);
 int weft_txn_commit(unsigned long long txnid);
 int weft_txn_abort(unsigned long long txnid);
 int weft_txn_recover(void);
@@ -81,22 +81,27 @@ static int count_of(sqlite3 *db, const char *sql) {
 
 // Move one item from the world to the avatar, as one group.
 //
-// Both databases stage first, so neither is visible. The record is then written in one
-// transaction, and that write is the commit: after it the grant has happened, whether or
-// not this process lives to move the heads.
+// Both databases join the group before either is written to. That order is the whole
+// point: SQLite ends a statement by calling xSync, and a file in a group stages there
+// instead of committing, so neither write is visible on its own. Joining afterwards would
+// be too late, because the first statement would already have committed by itself.
+//
+// The record is then written in one transaction, and that write is the commit: after it
+// the grant has happened, whether or not this process lives to move the heads.
 static int grant(sqlite3 *world, sqlite3 *avatar, int item) {
 	char sql[160];
 	unsigned long long txnid = 0;
 
 	if (weft_txn_begin(&txnid) != SQLITE_OK) return 1;
 
+	if (weft_txn_join(world, txnid) != SQLITE_OK) goto give_up;
+	if (weft_txn_join(avatar, txnid) != SQLITE_OK) goto give_up;
+
 	snprintf(sql, sizeof sql, "DELETE FROM loot WHERE k = %d", item);
 	if (run(world, sql)) goto give_up;
 	snprintf(sql, sizeof sql, "INSERT OR REPLACE INTO held VALUES (%d)", item);
 	if (run(avatar, sql)) goto give_up;
 
-	if (weft_txn_stage(world, txnid) != SQLITE_OK) goto give_up;
-	if (weft_txn_stage(avatar, txnid) != SQLITE_OK) goto give_up;
 	return weft_txn_commit(txnid) != SQLITE_OK;
 
 give_up:

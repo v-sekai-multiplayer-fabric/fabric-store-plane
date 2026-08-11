@@ -323,6 +323,10 @@ typedef struct {
 	uint64_t base_pages; // the pages of the newest shard version
 	uint64_t log_pages;  // the pages committed since that version
 
+	// The group this file joined, or zero. While it is set, a sync stages instead of
+	// committing, because the group's record is what makes the write real.
+	uint64_t group_txnid;
+
 	int64_t size;      // the file size, counting what is buffered
 	int64_t sent_size; // the file size the store holds
 
@@ -756,8 +760,19 @@ static int should_compact(FdbFile *f);
 // shape CockroachDB calls a parallel commit: the writes are staged, and the commit is
 // the single record that makes them real. The staged pages are safe to leave behind,
 // because `drop_unfinished_commit` clears any txid above the head at the next open.
+static int txn_stage_here(FdbFile *f);
+
 static int flush(FdbFile *f) {
 	if (f->ndirty == 0 && f->trunc_pages < 0 && f->size == f->sent_size) return SQLITE_OK;
+
+	// A file that joined a group does not commit when SQLite says so. It stages, and the
+	// group's record is what commits it later.
+	//
+	// This has to happen here rather than in a call after the fact. SQLite ends a
+	// statement by writing its pages and calling xSync, and this is xSync: by the time a
+	// caller could ask to stage, an ordinary flush would already have moved the head and
+	// the write would be visible on its own. That is the whole failure this catches.
+	if (f->group_txnid) return txn_stage_here(f);
 
 	struct flush_ctx c = {f, f->head + 1, 0, f->ndirty};
 	int rc;
@@ -1042,37 +1057,54 @@ static FdbFile *file_of(sqlite3 *db) {
 	return is_fdb_file(file) ? (FdbFile *)file : NULL;
 }
 
-// Write one participant's intent: its pages, under a txid whose head does not move.
+// Join a database to the group, before it is written to.
 //
-// This is `flush`'s staging half with the head left alone on purpose. Nothing can read
-// these pages, because no PIDX row points at them and the head is unchanged.
-int weft_txn_stage(sqlite3 *db, uint64_t txnid) {
+// From here until the group commits, this file's syncs stage instead of committing. That
+// ordering is the point: SQLite ends a statement by writing pages and calling xSync, so a
+// caller cannot stage after the fact — the write would already be visible on its own.
+int weft_txn_join(sqlite3 *db, uint64_t txnid) {
 	FdbFile *f = file_of(db);
 	if (!f || !g_group.open || g_group.txnid != txnid) return SQLITE_MISUSE;
 	if (g_group.nparts >= TXN_MAX_PARTS) return SQLITE_FULL;
 
-	// SQLite may still be holding pages. Ask it to hand them over without committing, so
-	// what the VFS buffered is the whole of this participant's write.
-	if (f->ndirty == 0 && f->size == f->sent_size) {
-		// Nothing to stage. A participant that writes nothing is still a participant, so
-		// that a reader of the record sees the whole group.
-		g_group.files[g_group.nparts] = f;
-		g_group.txids[g_group.nparts] = f->head;
-		g_group.nparts++;
-		return SQLITE_OK;
+	// A participant that writes nothing is still a participant, so a reader of the record
+	// sees the whole group. Its staged txid stays its head until a sync says otherwise.
+	for (int i = 0; i < g_group.nparts; i++) {
+		if (g_group.files[i] == f) return SQLITE_OK;
 	}
+	g_group.files[g_group.nparts] = f;
+	g_group.txids[g_group.nparts] = f->head;
+	g_group.nparts++;
+	f->group_txnid = txnid;
+	return SQLITE_OK;
+}
 
-	// An intent has to be all or nothing, so recovery can decide it by reading one key.
+// Write this participant's intent: its pages, under a txid whose head does not move.
+//
+// This is `flush`'s staging half with the head left alone on purpose. Nothing can read
+// these pages, because no PIDX row points at them and the head is unchanged. The dirty
+// buffer is kept, so this process still sees its own writes and so resolving has the page
+// numbers it needs to build the index.
+static int txn_stage_here(FdbFile *f) {
+	// An intent has to be all or nothing, so recovery can decide a participant by reading
+	// one key instead of counting pages.
 	if (f->ndirty > ONE_TXN_PAGES) return SQLITE_TOOBIG;
 
 	struct flush_ctx c = {f, f->head + 1, 0, f->ndirty};
-	int rc = run_txn(delta_body, &c, 1, SQLITE_IOERR_WRITE);
-	if (rc != SQLITE_OK) return rc;
+	if (f->ndirty > 0) {
+		int rc = run_txn(delta_body, &c, 1, SQLITE_IOERR_WRITE);
+		if (rc != SQLITE_OK) return rc;
+	}
 
-	g_group.files[g_group.nparts] = f;
-	g_group.txids[g_group.nparts] = c.txid;
-	g_group.nparts++;
-	return SQLITE_OK;
+	for (int i = 0; i < g_group.nparts; i++) {
+		if (g_group.files[i] == f) {
+			g_group.txids[i] = f->ndirty > 0 ? c.txid : f->head;
+			return SQLITE_OK;
+		}
+	}
+	// A sync on a file whose group flag is set but which is not in the group is a bug in
+	// the caller's bookkeeping, not something to commit around.
+	return SQLITE_MISUSE;
 }
 
 struct record_ctx {
@@ -1125,6 +1157,7 @@ static int txn_resolve_group(uint64_t txnid, int drop_record);
 // caller whose stage fails has to be able to let go, or the next group waits forever.
 int weft_txn_abort(uint64_t txnid) {
 	if (!g_group.open || g_group.txnid != txnid) return SQLITE_MISUSE;
+	for (int i = 0; i < g_group.nparts; i++) g_group.files[i]->group_txnid = 0;
 	g_group.open = 0;
 	g_group.nparts = 0;
 	pthread_mutex_unlock(&g_group_lock);
@@ -1137,6 +1170,7 @@ int weft_txn_commit(uint64_t txnid) {
 	struct record_ctx c = {txnid};
 	int rc = run_txn(record_body, &c, 1, SQLITE_IOERR_WRITE);
 	if (rc != SQLITE_OK) {
+		for (int i = 0; i < g_group.nparts; i++) g_group.files[i]->group_txnid = 0;
 		g_group.open = 0;
 		pthread_mutex_unlock(&g_group_lock);
 		return rc;
@@ -1147,6 +1181,7 @@ int weft_txn_commit(uint64_t txnid) {
 	crash_point();
 	(void)txn_resolve_group(txnid, 1);
 
+	for (int i = 0; i < g_group.nparts; i++) g_group.files[i]->group_txnid = 0;
 	g_group.open = 0;
 	pthread_mutex_unlock(&g_group_lock);
 	return SQLITE_OK;
