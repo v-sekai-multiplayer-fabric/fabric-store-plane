@@ -128,6 +128,20 @@ jobs:
             exit 1
           fi
 
+  # The read-ahead window's safety argument. Pure Lean and no dependencies, so this is the
+  # cheapest job here and the only one that checks a proof rather than a run.
+  spec:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: leanprover/lean-action@v1
+        with:
+          lake-package-directory: spec
+          build: true
+          test: false
+          lint: false
+
   fuzz:
     runs-on: ubuntu-24.04
     timeout-minutes: 30

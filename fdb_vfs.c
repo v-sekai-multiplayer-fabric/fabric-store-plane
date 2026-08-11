@@ -331,6 +331,18 @@ typedef struct {
 	// because the commit that notices is the worst moment to do the work.
 	int compact_due;
 
+	// Read-ahead. `ra_score` is how much this file looks like a scan, `ra_last` is the page
+	// the score was last moved by, and the window is what a prefetch brought back.
+	int ra_score;
+	uint32_t ra_last;
+	uint8_t *ra_window; // ra_count pages, or NULL until a scan earns one
+	// What the prefetch learned about each page in the window. Absent and unfetched have
+	// to be different answers: a page the prefetch chose to skip still exists, and reading
+	// it as a hole would hand SQLite a zeroed page.
+	uint8_t *ra_state; // RA_UNFETCHED, RA_PRESENT or RA_ABSENT
+	uint32_t ra_first;
+	uint32_t ra_count;
+
 	int64_t size;      // the file size, counting what is buffered
 	int64_t sent_size; // the file size the store holds
 
@@ -380,6 +392,231 @@ static void clear_dirty(FdbFile *f) {
 	f->trunc_pages = -1;
 }
 
+// ── Read-ahead ────────────────────────────────────────────────────────────────
+//
+// A page miss is a network round trip, so a VFS over FoundationDB lives or dies here. A
+// cold scan of a thousand pages was a thousand round trips, and `docs/spec/Prefetch.lean`
+// models the way out.
+//
+// It does not pick a depth. It scores the access pattern, and the numbers below are that
+// model's, not ones chosen here:
+//
+//   forward page, gap of 8 or less   score + 2, capped at 12
+//   random page, a scan is running   score - 1
+//   random page, no scan             score - 4
+//   score of 6 or more               escalate read-ahead
+//   score of 10 or more              full depth, 256 pages or 1 MB
+//
+// Up 2 and down 4 means a scan must be twice as consistent as the noise to hold its
+// credit. The softer decay while a scan is already running tolerates the interleaving a
+// real B-tree walk gives. So a point read pays for no read-ahead, and a table scan
+// escalates after three pages, and neither is configured.
+//
+// What makes the prefetch cheap is the layout. PIDX is keyed by page number, so the owners
+// of a run of pages are one contiguous range read. A compacted database keeps its pages in
+// SHARD, also keyed by page number, so those are a second contiguous range read. A scan
+// over a folded database therefore costs two round trips for every 256 pages instead of
+// 256. Pages still in the log are scattered by txid and are left to the ordinary path,
+// which is why compaction is what makes a scan fast rather than read-ahead alone.
+
+#define RA_GAP 8
+#define RA_SCORE_STEP 2
+#define RA_SCORE_CAP 12
+#define RA_DECAY_SCANNING 1
+#define RA_DECAY_RANDOM 4
+#define RA_ESCALATE 6
+#define RA_FULL 10
+
+// Full depth is 256 pages or 1 MB, whichever is smaller, which at a 4 KiB page is both.
+#define RA_MAX_PAGES 256
+#define RA_STEP_PAGES 32
+
+// A prefetch does not fetch every page it covers, so the window has to say which of the
+// three it means. Skipping this distinction reads a log-owned page as a hole.
+#define RA_UNFETCHED 0
+#define RA_PRESENT 1
+#define RA_ABSENT 2
+
+// Move the score by what this page number says about the pattern, and answer how many
+// pages are worth fetching ahead.
+static uint32_t ra_depth(FdbFile *f, uint32_t pgno) {
+	const int64_t gap = (int64_t)pgno - (int64_t)f->ra_last;
+
+	if (gap > 0 && gap <= RA_GAP) {
+		f->ra_score += RA_SCORE_STEP;
+		if (f->ra_score > RA_SCORE_CAP) f->ra_score = RA_SCORE_CAP;
+	} else if (f->ra_score >= RA_ESCALATE) {
+		f->ra_score -= RA_DECAY_SCANNING;
+	} else {
+		f->ra_score -= RA_DECAY_RANDOM;
+		if (f->ra_score < 0) f->ra_score = 0;
+	}
+	f->ra_last = pgno;
+
+	if (f->ra_score >= RA_FULL) return RA_MAX_PAGES;
+	if (f->ra_score >= RA_ESCALATE) return RA_STEP_PAGES;
+	return 0;
+}
+
+// Is this page already in the window a prefetch brought back?
+static int ra_hit(FdbFile *f, uint32_t pgno, uint8_t *out, int *len, int *present) {
+	if (!f->ra_window || pgno < f->ra_first || pgno >= f->ra_first + f->ra_count) return 0;
+	const uint32_t i = pgno - f->ra_first;
+
+	if (f->ra_state[i] == RA_ABSENT) {
+		// The prefetch looked and there was nothing there, which is as good an answer as a
+		// page and saves the same round trip.
+		*present = 0;
+		*len = 0;
+		return 1;
+	}
+	if (f->ra_state[i] != RA_PRESENT) return 0; // never fetched, so this says nothing
+
+	memcpy(out, f->ra_window + (size_t)i * PAGE, PAGE);
+	*len = PAGE;
+	*present = 1;
+	return 1;
+}
+
+// Read a run of pages in as few round trips as the layout allows.
+//
+// Anything this cannot place is simply left out of the window, and the ordinary path picks
+// it up one page at a time. A prefetch that guesses wrong costs a range read, never a
+// wrong answer.
+static fdb_error_t ra_fill(FDBTransaction *tr, FdbFile *f, uint32_t first, uint32_t count) {
+	if (!f->ra_window) {
+		f->ra_window = malloc((size_t)RA_MAX_PAGES * PAGE);
+		f->ra_state = malloc(RA_MAX_PAGES);
+		if (!f->ra_window || !f->ra_state) {
+			free(f->ra_window);
+			free(f->ra_state);
+			f->ra_window = NULL;
+			f->ra_state = NULL;
+			return 0; // no window, so no read-ahead; the ordinary path still answers
+		}
+	}
+	if (count > RA_MAX_PAGES) count = RA_MAX_PAGES;
+	memset(f->ra_state, RA_UNFETCHED, count);
+	f->ra_first = first;
+	f->ra_count = count;
+
+	uint8_t from[KEYMAX], to[KEYMAX];
+
+	// How far the reads below actually reached.
+	//
+	// A range read answers with what fitted and says `more` when it stopped early, and a
+	// window of 256 pages is a megabyte, which is the size that gets stopped. A page the
+	// read never reached is one nothing is known about, and `spec/ReadAhead.lean` proves
+	// that calling it absent loses it: `ignoring_more_loses_a_page`.
+	//
+	// So coverage is tracked and the window shrinks to it. A page past the end is then
+	// outside the window entirely, which the same file proves is always safe.
+	uint32_t covered_to = first + count;
+
+	// Which txid owns each page, as one range read. A page with no row here comes from the
+	// shard, which is the common case for a folded database.
+	uint64_t *owner = calloc(count, sizeof(uint64_t));
+	if (!owner) return 0;
+
+	int flen = key_pidx(from, f->name, first);
+	int tlen = key_pidx(to, f->name, first + count);
+	FDBFuture *fu = fdb_transaction_get_range(tr, FDB_KEYSEL_FIRST_GREATER_OR_EQUAL(from, flen),
+	                                          FDB_KEYSEL_FIRST_GREATER_OR_EQUAL(to, tlen), 0, 0,
+	                                          FDB_STREAMING_MODE_WANT_ALL, 0, 0, 0);
+	fdb_error_t err = await(fu);
+	if (!err) {
+		const FDBKeyValue *kv;
+		int n;
+		fdb_bool_t more;
+		err = fdb_future_get_keyvalue_array(fu, &kv, &n, &more);
+		if (!err) {
+			uint32_t reached = first;
+			for (int i = 0; i < n; i++) {
+				if (kv[i].key_length < 4 || kv[i].value_length != 8) continue;
+				const uint8_t *p = kv[i].key + kv[i].key_length - 4;
+				uint32_t page = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16)
+				                | ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+				if (page >= first && page < first + count) {
+					owner[page - first] = get_be64(kv[i].value);
+					if (page + 1 > reached) reached = page + 1;
+				}
+			}
+			// PIDX is sparse, so a short answer is ordinary and says nothing on its own.
+			// Only `more` means the read stopped before the end of the range.
+			if (more && reached < covered_to) covered_to = reached;
+		}
+	}
+	fdb_future_destroy(fu);
+	if (err) {
+		free(owner);
+		return err;
+	}
+
+	// The pages the shard holds, as a second range read. SHARD is keyed by page number
+	// under one version, so a run of pages is one contiguous range.
+	if (f->has_shard) {
+		flen = key_shard(from, f->name, f->shard_as_of, first);
+		tlen = key_shard(to, f->name, f->shard_as_of, first + count);
+		fu = fdb_transaction_get_range(tr, FDB_KEYSEL_FIRST_GREATER_OR_EQUAL(from, flen),
+		                               FDB_KEYSEL_FIRST_GREATER_OR_EQUAL(to, tlen), 0, 0,
+		                               FDB_STREAMING_MODE_WANT_ALL, 0, 0, 0);
+		err = await(fu);
+		if (!err) {
+			const FDBKeyValue *kv;
+			int n;
+			fdb_bool_t more;
+			err = fdb_future_get_keyvalue_array(fu, &kv, &n, &more);
+			if (!err) {
+				uint32_t reached = first;
+				for (int i = 0; i < n; i++) {
+					if (kv[i].key_length < 4 || kv[i].value_length > PAGE) continue;
+					const uint8_t *p = kv[i].key + kv[i].key_length - 4;
+					uint32_t page = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16)
+					                | ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+					if (page < first || page >= first + count) continue;
+					const uint32_t j = page - first;
+					// A page the log owns is newer than the shard's copy, so it is not this.
+					if (owner[j]) continue;
+					memset(f->ra_window + (size_t)j * PAGE, 0, PAGE);
+					memcpy(f->ra_window + (size_t)j * PAGE, kv[i].value,
+					       (size_t)kv[i].value_length);
+					f->ra_state[j] = RA_PRESENT;
+					if (page + 1 > reached) reached = page + 1;
+				}
+				if (more && reached < covered_to) covered_to = reached;
+			}
+		}
+		fdb_future_destroy(fu);
+	}
+
+	// A page whose owner is a txid stays unfetched: DELTA is keyed by txid first, so those
+	// are scattered and are not one range. The ordinary path reads them, and compaction is
+	// what moves them into the shard where a scan can reach them cheaply.
+	//
+	// A page with no owner and nothing in the shard is genuinely a hole, and saying so is
+	// worth as much as a page: it saves the same round trip. That is only true because the
+	// range read above covered it, which is why the two cases cannot share a flag.
+	for (uint32_t i = 0; i < count; i++) {
+		if (owner[i]) f->ra_state[i] = RA_UNFETCHED;
+		else if (f->ra_state[i] != RA_PRESENT) f->ra_state[i] = f->has_shard ? RA_ABSENT
+		                                                                    : RA_UNFETCHED;
+	}
+
+	// Shrink to what was actually read. Everything past this was never looked at, and the
+	// ordinary path answers for it one page at a time.
+	f->ra_count = covered_to > first ? covered_to - first : 0;
+
+	free(owner);
+	return err;
+}
+
+// Throw the window away.
+//
+// A window survives the transaction that filled it, so anything that changes what a page
+// holds, or where it lives, must drop it. The fence stops another process from being that
+// thing, so it is only ever this one: a commit, a fold, or a truncate.
+static void ra_reset(FdbFile *f) { f->ra_count = 0; }
+
 // Read one page from the store. `present` stays 0 when no commit and no shard holds it,
 // and the caller then zero-fills.
 static fdb_error_t page_from_store(FDBTransaction *tr, FdbFile *f, uint32_t pgno,
@@ -390,6 +627,15 @@ static fdb_error_t page_from_store(FDBTransaction *tr, FdbFile *f, uint32_t pgno
 
 	*present = 0;
 	*len = 0;
+
+	if (ra_hit(f, pgno, out, len, present)) return 0;
+
+	const uint32_t depth = ra_depth(f, pgno);
+	if (depth) {
+		fdb_error_t pre = ra_fill(tr, f, pgno, depth);
+		if (pre) return pre;
+		if (ra_hit(f, pgno, out, len, present)) return 0;
+	}
 
 	int klen = key_pidx(key, f->name, pgno);
 	fdb_error_t err = get_u64(tr, key, klen, &owner, &got);
@@ -800,6 +1046,7 @@ static int flush(FdbFile *f) {
 	f->sent_size = f->size;
 	f->log_pages += (uint64_t)f->ndirty;
 	clear_dirty(f);
+	ra_reset(f); // those pages are not what the window holds any more
 
 	// Note that a fold is owed; do not do it here. Folding on the commit that happens to
 	// trip the ratio charges one writer for work every writer caused, and the bill grows
@@ -953,6 +1200,7 @@ static int compact(FdbFile *f) {
 	f->shard_as_of = as_of;
 	f->base_pages = kept;
 	f->log_pages = 0;
+	ra_reset(f); // the window points at a shard version that is no longer the one read
 	return SQLITE_OK;
 }
 
@@ -1210,6 +1458,7 @@ static int txn_resolve_part(FdbFile *f, uint64_t staged) {
 	f->sent_size = f->size;
 	f->log_pages += (uint64_t)f->ndirty;
 	clear_dirty(f);
+	ra_reset(f);
 	return SQLITE_OK;
 }
 
@@ -1575,6 +1824,7 @@ static int fdb_truncate(sqlite3_file *file, sqlite3_int64 size) {
 
 	if (f->trunc_pages < 0 || npages < f->trunc_pages) f->trunc_pages = npages;
 	f->size = size;
+	ra_reset(f);
 	return SQLITE_OK;
 }
 
@@ -1606,6 +1856,11 @@ static int fdb_close(sqlite3_file *file) {
 	free(f->dirty);
 	f->dirty = NULL;
 	f->capdirty = 0;
+	free(f->ra_window);
+	free(f->ra_state);
+	f->ra_window = NULL;
+	f->ra_state = NULL;
+	f->ra_count = 0;
 	return rc;
 }
 

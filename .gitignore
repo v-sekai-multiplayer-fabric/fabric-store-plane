@@ -14,3 +14,4 @@ compile_commands.json
 # antlr4, which FuzzTest pulls in, installs its runtime beside the CMakeLists that
 # fetched it rather than into the build directory.
 fuzz/dist/
+/spec/.lake/
