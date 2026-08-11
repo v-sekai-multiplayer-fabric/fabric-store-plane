@@ -115,6 +115,9 @@
 
 static FDBDatabase *g_db;
 static pthread_t g_network_thread;
+static int g_started;
+
+void weft_fdb_stop(void);
 
 // ── Fault injection ───────────────────────────────────────────────────────────
 //
@@ -151,11 +154,28 @@ int weft_fdb_start(const char *cluster_file) {
 	if (err) return err;
 	if ((err = fdb_setup_network())) return err;
 	if (pthread_create(&g_network_thread, NULL, run_network, NULL)) return -1;
+	g_started = 1;
+
+	// Stop on the way out, however the caller leaves.
+	//
+	// The network thread outlives a `return` from main, and a process that exits while it
+	// is still running crashes. Every program here has error paths that return without
+	// stopping, so a refused open reported itself as a segfault — a harness hiding the
+	// failure it exists to show. Registering it once fixes all of them, including ones not
+	// written yet.
+	atexit(weft_fdb_stop);
 	return fdb_create_database(cluster_file, &g_db);
 }
 
+// Idempotent, because it is now called both by hand and at exit, and joining a thread twice
+// is not a thing to leave to luck.
 void weft_fdb_stop(void) {
-	if (g_db) fdb_database_destroy(g_db);
+	if (!g_started) return;
+	g_started = 0;
+	if (g_db) {
+		fdb_database_destroy(g_db);
+		g_db = NULL;
+	}
 	fdb_stop_network();
 	pthread_join(g_network_thread, NULL);
 }
@@ -1593,6 +1613,8 @@ static fdb_error_t read_parts_body(FDBTransaction *tr, void *ctx, int *final) {
 struct intent_ctx {
 	const TxnPart *part;
 	int present;
+	// Whether this participant's fence must go up. Only a missing intent needs it.
+	int fence_it;
 	uint64_t head;
 	uint32_t pgno[4096];
 	int npages;
@@ -1680,20 +1702,29 @@ static fdb_error_t resolve_body(FDBTransaction *tr, void *ctx, int *final) {
 	return 0;
 }
 
-// Prevent, then abort. Raising the fence is what makes it stick: a committer that comes
-// back to move a head reads the fence inside its own write transaction and is refused, so
-// the group can never become committed after this.
+// Give up one participant of an aborted group. Two jobs, and conflating them is the fault.
+//
+// The pages always go: they are unreachable and nothing will ever point at them.
+//
+// The fence goes up only for the participant whose intent was missing, which is the write
+// that must never land. ParallelCommits.tla bumps the timestamp cache for the key it failed
+// to find and for no other, and the difference is not cosmetic: raising the fence on a
+// healthy participant invalidates every live handle on a database that had nothing wrong
+// with it. Measured on a record with one present intent and one missing, the healthy
+// participant's fence went from 1 to 2 before this, and stays at 1 now.
 static fdb_error_t prevent_body(FDBTransaction *tr, void *ctx, int *final) {
 	(void)final;
 	struct intent_ctx *c = ctx;
 	uint8_t key[KEYMAX], from[KEYMAX], to[KEYMAX];
-	uint64_t fence = 0;
-	int got = 0;
 
-	int klen = key_meta(key, c->part->name, "FENCE");
-	fdb_error_t err = get_u64(tr, key, klen, &fence, &got);
-	if (err) return err;
-	set_u64(tr, key, klen, got ? fence + 1 : 1);
+	if (c->fence_it) {
+		uint64_t fence = 0;
+		int got = 0;
+		int klen = key_meta(key, c->part->name, "FENCE");
+		fdb_error_t err = get_u64(tr, key, klen, &fence, &got);
+		if (err) return err;
+		set_u64(tr, key, klen, got ? fence + 1 : 1);
+	}
 
 	// The staged pages are unreachable now and nothing will ever point at them.
 	int flen = key_delta_txid(from, c->part->name, c->part->txid);
@@ -1736,6 +1767,7 @@ static int recover_one(uint64_t txnid) {
 	}
 
 	for (int i = 0; i < c.nparts; i++) {
+		intents[i].fence_it = !intents[i].present;
 		rc = run_txn(prevent_body, &intents[i], 1, SQLITE_IOERR_WRITE);
 		if (rc != SQLITE_OK) return rc;
 	}

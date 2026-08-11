@@ -78,6 +78,40 @@ static int count_of(sqlite3 *db, const char *sql) {
 	return n;
 }
 
+// A group that is begun and given up must leave nothing behind.
+//
+// A participant stages under head + 1, and a group that never committed moved no head, so
+// the next group stages under the same txid. If the abandoned pages survive, they answer
+// the next group's intent check and two groups' writes commit as one. This gives up a group
+// deliberately, then makes a real grant, and the conservation check at the end is what says
+// whether the dead group's pages came along.
+static int abandon_a_group(sqlite3 *world, sqlite3 *avatar) {
+	char sql[160];
+	unsigned long long txnid = 0;
+
+	if (weft_txn_begin(&txnid) != SQLITE_OK) return 1;
+	if (weft_txn_join(world, txnid) != SQLITE_OK) goto give_up;
+	if (weft_txn_join(avatar, txnid) != SQLITE_OK) goto give_up;
+
+	// A group is an explicit SQLite transaction, and giving one up is a ROLLBACK.
+	//
+	// Clearing the staged pages is not enough on its own. SQLite has a page cache of its
+	// own, and with locking_mode=EXCLUSIVE it trusts it: a statement that ran in autocommit
+	// has already finished as far as SQLite is concerned, and nothing the VFS does to
+	// FoundationDB afterwards can make it forget. The next commit would carry those pages
+	// forward and the abandoned write would arrive under a later group.
+	//
+	// Inside a transaction there is nothing to unwind, because SQLite writes its pages at
+	// COMMIT and a ROLLBACK never reaches the VFS at all.
+	if (run(avatar, "BEGIN")) goto give_up;
+	snprintf(sql, sizeof sql, "INSERT OR REPLACE INTO held VALUES (%d)", 9999);
+	if (run(avatar, sql)) { sqlite3_exec(avatar, "ROLLBACK", NULL, NULL, NULL); goto give_up; }
+	if (run(avatar, "ROLLBACK")) goto give_up;
+
+give_up:
+	return weft_txn_abort(txnid) != SQLITE_OK;
+}
+
 // Move one item from the world to the avatar, as one group.
 //
 // Both databases join the group before either is written to. That order is the whole
@@ -96,10 +130,19 @@ static int grant(sqlite3 *world, sqlite3 *avatar, int item) {
 	if (weft_txn_join(world, txnid) != SQLITE_OK) goto give_up;
 	if (weft_txn_join(avatar, txnid) != SQLITE_OK) goto give_up;
 
+	// One explicit transaction for each participant, so each stages once at its COMMIT
+	// rather than once per statement, and so a failure part way can be rolled back.
+	if (run(world, "BEGIN")) goto give_up;
+	if (run(avatar, "BEGIN")) goto give_up;
+
 	snprintf(sql, sizeof sql, "DELETE FROM loot WHERE k = %d", item);
 	if (run(world, sql)) goto give_up;
 	snprintf(sql, sizeof sql, "INSERT OR REPLACE INTO held VALUES (%d)", item);
 	if (run(avatar, sql)) goto give_up;
+
+	// These COMMITs stage; they do not commit. The record does that.
+	if (run(world, "COMMIT")) goto give_up;
+	if (run(avatar, "COMMIT")) goto give_up;
 
 	return weft_txn_commit(txnid) != SQLITE_OK;
 
@@ -131,6 +174,10 @@ static int writer(const char *world_name, const char *avatar_name, int grants) {
 	}
 	if (run(world, "COMMIT")) return 1;
 
+	// Give up a group before handing anything over, so the grants below stage under a txid
+	// an abandoned group already used.
+	if (abandon_a_group(world, avatar)) return 1;
+
 	// Hand every item over, one group at a time. The crash lands in one of them.
 	for (int i = 0; i < grants; i++) {
 		if (grant(world, avatar, i)) return 1;
@@ -158,6 +205,13 @@ static int check(const char *world_name, const char *avatar_name, int grants) {
 
 	const int remaining = count_of(world, "SELECT count(*) FROM loot");
 	const int held = count_of(avatar, "SELECT count(*) FROM held");
+
+	// The abandoned group wrote key 9999 and was given up. If it is here, a dead group's
+	// pages were committed by a later group.
+	const int ghost = count_of(avatar, "SELECT count(*) FROM held WHERE k = 9999");
+	if (ghost > 0) {
+		printf("GHOST: a group that was given up left %d row(s) behind\n", ghost);
+	}
 	if (remaining < 0 || held < 0) {
 		printf("no tables yet, so nothing was granted\n");
 		sqlite3_close(world);
@@ -177,7 +231,7 @@ static int check(const char *world_name, const char *avatar_name, int grants) {
 	// `prove_crash` is the program that establishes those land whole or not at all. So the
 	// sum is zero or it is `grants`, and any other value is an item that went missing or
 	// got duplicated between the two databases.
-	int bad = 0;
+	int bad = ghost > 0;
 	if (remaining + held == 0) {
 		printf("unseeded: the crash landed in setup, so there was nothing to conserve\n");
 	} else if (remaining + held != grants) {
