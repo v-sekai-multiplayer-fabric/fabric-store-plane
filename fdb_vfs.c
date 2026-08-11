@@ -1505,9 +1505,15 @@ static fdb_error_t sweep_body(FDBTransaction *tr, void *ctx, int *final) {
 	return err;
 }
 
-// Decide every staging record. Call it before opening any database: opening raises a
-// fence, and a fence raised under a group that was implicitly committed would prevent a
-// commit that already happened.
+// Decide every staging record.
+//
+// `vfs_open` calls this before it raises a fence, which is what makes the ordering
+// structural rather than remembered. It stays public because a process may want to settle
+// what a crash left before it opens anything at all, and because recovery is a thing a
+// caller can reasonably ask for on its own.
+//
+// Safe to call from more than one thread and more than one process: every outcome it can
+// reach is idempotent, which is the property that lets any finder of a record decide it.
 int weft_txn_recover(void) {
 	for (;;) {
 		struct sweep_ctx c = {{0}, 0};
@@ -1609,8 +1615,25 @@ static int vfs_open(sqlite3_vfs *vfs, const char *name, sqlite3_file *file, int 
 	f->trunc_pages = -1;
 	snprintf(f->name, MAX_NAME, "%s", name ? name : "anonymous");
 
+	// Decide every staging group before this open raises a fence.
+	//
+	// This ordering is not a preference. Opening raises the fence, and a fence raised over a
+	// group that is already implicitly committed prevents a commit that has happened: the
+	// staged pages become unreachable and recovery, finding an intent it can no longer
+	// reach, aborts a group the protocol says must be finished. The write was acknowledged
+	// and is then destroyed, with nothing anywhere reporting it.
+	//
+	// It used to be a rule in a comment that callers obeyed by hand. A rule that holds only
+	// while somebody remembers it is the kind of fault the rest of this suite exists to
+	// catch, so it lives here now, where it cannot be got wrong.
+	//
+	// The cost is one range read for each open. Records are dropped as they are decided, so
+	// in the steady state that read finds nothing and the sweep stops.
+	int rc = weft_txn_recover();
+	if (rc != SQLITE_OK) return rc;
+
 	struct open_ctx c = {f};
-	int rc = run_txn(open_body, &c, 1, SQLITE_IOERR);
+	rc = run_txn(open_body, &c, 1, SQLITE_IOERR);
 	if (rc != SQLITE_OK) return rc;
 
 	if (out_flags) *out_flags = flags;

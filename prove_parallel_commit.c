@@ -46,7 +46,6 @@ int weft_txn_begin(unsigned long long *txnid);
 int weft_txn_join(sqlite3 *db, unsigned long long txnid);
 int weft_txn_commit(unsigned long long txnid);
 int weft_txn_abort(unsigned long long txnid);
-int weft_txn_recover(void);
 
 static int run(sqlite3 *db, const char *sql) {
 	char *err = NULL;
@@ -114,7 +113,6 @@ give_up:
 static int writer(const char *world_name, const char *avatar_name, int grants) {
 	if (weft_fdb_start(getenv("WEFT_FDB_CLUSTER_FILE"))) return 1;
 	weft_vfs_register(1);
-	if (weft_txn_recover() != SQLITE_OK) return 1;
 
 	sqlite3 *world = open_db(world_name);
 	sqlite3 *avatar = open_db(avatar_name);
@@ -149,14 +147,11 @@ static int check(const char *world_name, const char *avatar_name, int grants) {
 	if (weft_fdb_start(getenv("WEFT_FDB_CLUSTER_FILE"))) return 1;
 	weft_vfs_register(1);
 
-	// Recovery first, and before any database is opened. Opening raises a fence, and a
-	// fence raised over a group that was already implicitly committed would prevent a
-	// commit that has happened.
-	if (weft_txn_recover() != SQLITE_OK) {
-		fprintf(stderr, "recovery failed\n");
-		return 1;
-	}
-
+	// Nothing calls recovery here, and that is the point. Opening raises a fence, and a
+	// fence raised over a group that was already implicitly committed would prevent a commit
+	// that has happened, so recovery has to come first. `vfs_open` does it, so the ordering
+	// holds whether or not a caller knows about it. If that ever stops being true, the sum
+	// below is what says so.
 	sqlite3 *world = open_db(world_name);
 	sqlite3 *avatar = open_db(avatar_name);
 	if (!world || !avatar) return 1;
