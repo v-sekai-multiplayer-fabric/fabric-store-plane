@@ -214,4 +214,178 @@ theorem resolve_twice (w : World) (p : Db × Txid) :
     ((resolve (resolve w p) p).db p.1).head = ((resolve w p).db p.1).head := by
   simp [resolve, setDb]
 
+/-! ## The legal steps
+
+The properties above are about single operations. The TLA spec's are about every run: a
+record that is committed stays committed, whatever happens next. That needs a relation
+saying which steps are allowed at all, and writing it down turns out to be where the
+protocol's guards live.
+
+Two of them are not decoration:
+
+* `stage` and `record` are only legal while the record is pending. Staging into a group
+  that has already committed would add a participant whose intent nobody checked, and the
+  group would stop being committed after it already was.
+* `abort` is only legal when the group is **not** implicitly committed. Recovery obeys this
+  — it aborts only on a missing intent — and without it recovery could abort a commit that
+  had already happened, which is the whole failure the protocol exists to prevent. -/
+inductive Step : World → World → Prop where
+  | stage (w : World) (d : Db) : w.txn.status = Status.pending → Step w (stage w d)
+  | record (w : World) : w.txn.status = Status.pending → Step w (writeRecord w)
+  | resolve (w : World) (p : Db × Txid) : Step w (resolve w p)
+  | prevent (w : World) (d : Db) : Step w (prevent w d)
+  | finish (w : World) : implicitlyCommitted w = true → Step w (finish w)
+  | abort (w : World) :
+      implicitlyCommitted w = false → w.txn.status ≠ Status.committed → Step w (abort w)
+
+/-- **Once committed, always committed.** `[](Committed => []Committed)` for one step, and
+so for a run by induction.
+
+The interesting cases are the two guards. A step that would un-commit a group is one the
+relation does not admit. -/
+theorem committed_stable {w w' : World} (h : Step w w') (hc : committed w = true) :
+    committed w' = true := by
+  cases h with
+  | stage d hp =>
+    exfalso
+    simp [committed, implicitlyCommitted, explicitlyCommitted, hp] at hc
+  | record hp =>
+    exfalso
+    simp [committed, implicitlyCommitted, explicitlyCommitted, hp] at hc
+  | resolve p =>
+    have hp : intentPresent (resolve w p) = intentPresent w := by
+      funext q
+      by_cases hq : q.1 = p.1 <;> simp [intentPresent, resolve, setDb, hq]
+    have he : committed (resolve w p) = committed w := by
+      simp only [committed, implicitlyCommitted, explicitlyCommitted, allIntentsPresent, hp]
+      rfl
+    rw [he]; exact hc
+  | prevent d =>
+    have hp : intentPresent (prevent w d) = intentPresent w := by
+      funext q
+      by_cases hq : q.1 = d <;> simp [intentPresent, prevent, setDb, hq]
+    have he : committed (prevent w d) = committed w := by
+      simp only [committed, implicitlyCommitted, explicitlyCommitted, allIntentsPresent, hp]
+      rfl
+    rw [he]; exact hc
+  | finish _ => exact finish_keeps_committed _
+  | abort hi hne =>
+    exfalso
+    simp [committed, implicitlyCommitted, explicitlyCommitted] at hc
+    rcases hc with hc | hc
+    · have hy : implicitlyCommitted w = true := by
+        simp [implicitlyCommitted, hc.1, hc.2]
+      rw [hi] at hy
+      exact Bool.noConfusion hy
+    · exact hne hc
+
+/-- Once a record is committed it stays committed, and once aborted it stays aborted. -/
+theorem committed_status_stable {w w' : World} (h : Step w w')
+    (hc : w.txn.status = Status.committed) : w'.txn.status = Status.committed := by
+  cases h with
+  | stage d hp => exfalso; rw [hp] at hc; exact Status.noConfusion hc
+  | record hp => exfalso; rw [hp] at hc; exact Status.noConfusion hc
+  | resolve p => simpa [resolve, setDb] using hc
+  | prevent d => simpa [prevent, setDb] using hc
+  | finish _ => simp [finish]
+  | abort _ hne => exact absurd hc hne
+
+/-! ## What only ever grows
+
+`TemporalTSCacheProperties` says the timestamp cache always advances. Here that is the
+fence, and it is the same property: a fence that could fall would un-prevent a writer that
+had been refused. The head is the same shape of fact for reads. -/
+
+theorem fence_never_falls {w w' : World} (h : Step w w') (d : Db) :
+    (w.db d).fence ≤ (w'.db d).fence := by
+  cases h with
+  | stage e _ => by_cases hd : d = e <;> simp [stage, setDb, hd]
+  | record _ => simp [writeRecord]
+  | resolve p => by_cases hd : d = p.1 <;> simp [resolve, setDb, hd]
+  | prevent e => by_cases hd : d = e <;> simp [prevent, setDb, hd]
+  | finish _ => simp [finish]
+  | abort _ _ => simp [abort]
+
+theorem head_never_falls {w w' : World} (h : Step w w') (d : Db) :
+    (w.db d).head ≤ (w'.db d).head := by
+  cases h with
+  | stage e _ => by_cases hd : d = e <;> simp [stage, setDb, hd]
+  | record _ => simp [writeRecord]
+  | resolve p =>
+    by_cases hd : d = p.1 <;> simp [resolve, setDb, hd, Nat.le_max_left]
+  | prevent e => by_cases hd : d = e <;> simp [prevent, setDb, hd]
+  | finish _ => simp [finish]
+  | abort _ _ => simp [abort]
+
+/-! ## Runs
+
+A run is any sequence of legal steps. The stability above lifts to it by induction, which
+is what `[](Committed => []Committed)` means. -/
+
+inductive Reachable : World → World → Prop where
+  | refl (w : World) : Reachable w w
+  | tail {w v u : World} : Reachable w v → Step v u → Reachable w u
+
+theorem committed_stays_committed {w w' : World} (r : Reachable w w')
+    (hc : committed w = true) : committed w' = true := by
+  induction r with
+  | refl => exact hc
+  | tail _ hs ih => exact committed_stable hs ih
+
+theorem fence_never_falls_in_a_run {w w' : World} (r : Reachable w w') (d : Db) :
+    (w.db d).fence ≤ (w'.db d).fence := by
+  induction r with
+  | refl => exact Nat.le_refl _
+  | tail _ hs ih => exact Nat.le_trans ih (fence_never_falls hs d)
+
+/-! ## Acknowledging, and finishing
+
+`AckImpliesCommit` and `AckLeadsToExplicitCommit`. A caller may be told the commit happened
+exactly when the record has landed with every intent present, which is one round. -/
+
+def mayAck (w : World) : Bool := implicitlyCommitted w
+
+theorem ack_implies_commit (w : World) (h : mayAck w = true) : committed w = true := by
+  simp [committed, mayAck] at *
+  simp [h]
+
+/-- Recovery, as a function rather than a process: whoever finds a staging record decides
+it, and the decision is forced. -/
+def recover (w : World) : World :=
+  if w.txn.status = Status.staging then
+    if implicitlyCommitted w then finish w else abort w
+  else w
+
+/-- **A staging record always ends finalized.** This is what `<>[]RecordFinalized` asks for,
+without the temporal machinery: recovery is total, so a record cannot sit staging once
+anybody looks. -/
+theorem recover_finalizes (w : World) (h : w.txn.status = Status.staging) :
+    finalized (recover w) = true := by
+  by_cases hi : implicitlyCommitted w <;> simp [recover, finalized, finish, abort, h, hi]
+
+/-- Recovery only ever takes a legal step, which is what makes the guards above true of it
+rather than merely stated near it. -/
+theorem recover_is_a_step (w : World) (h : w.txn.status = Status.staging) :
+    Step w (recover w) := by
+  by_cases hi : implicitlyCommitted w
+  · simpa [recover, h, hi] using Step.finish w hi
+  · have hne : w.txn.status ≠ Status.committed := by rw [h]; exact Status.noConfusion
+    simpa [recover, h, hi] using Step.abort w (by simpa using hi) hne
+
+/-- **An acknowledged commit becomes explicit.** `AckLeadsToExplicitCommit`: if a caller was
+told the group committed, recovery finishes it rather than aborting it. -/
+theorem ack_leads_to_explicit (w : World) (h : mayAck w = true) :
+    explicitlyCommitted (recover w) = true := by
+  have hs : w.txn.status = Status.staging := by
+    simp [mayAck, implicitlyCommitted] at h
+    exact h.1
+  simp [recover, hs, explicitlyCommitted, finish, mayAck] at *
+  simp [h]
+
+/-- And recovery run twice is recovery run once. -/
+theorem recover_idempotent (w : World) : recover (recover w) = recover w := by
+  by_cases hs : w.txn.status = Status.staging
+  · by_cases hi : implicitlyCommitted w <;> simp [recover, hs, hi, finish, abort]
+  · simp [recover, hs]
+
 end Weft.ParallelCommit
