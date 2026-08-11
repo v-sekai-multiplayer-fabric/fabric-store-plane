@@ -1268,6 +1268,15 @@ static int compact(FdbFile *f) {
 // FoundationDB transaction. That makes an intent all or nothing, so recovery can decide a
 // participant by reading one key instead of counting pages. A participant with more pages
 // than one transaction carries is refused at stage time.
+//
+// This is also why no participant row carries a page count. A count would let recovery see
+// that a write was short, and a write cannot be short here: staging is one transaction, and
+// the record is written only after every stage returned. `more` covers the other case, a
+// read cut off before the end of the range, and that is the one that was actually broken.
+//
+// It stops being true the moment staging spans more than one transaction, which is what #3
+// wants. A declared count is the thing to add then, and not before: a count that lives in
+// two places goes stale in one of them.
 
 #define TXN_MAX_PARTS 16
 
@@ -1459,6 +1468,11 @@ static void txn_discard_group(void) {
 		FdbFile *f = g_group.files[i];
 		if (g_group.txids[i] <= f->head) continue; // nothing was staged under it
 		struct discard_ctx c = {f, g_group.txids[i]};
+		// A discard that fails leaves pages under a txid the next group will stage under,
+		// which is #28. It is not lost, though: they sit above the head, and
+		// `drop_unfinished_commit` clears every txid above the head at the next open. So
+		// the failure costs a reopen rather than a wrong answer, and the other
+		// participants are still worth discarding.
 		(void)run_txn(discard_body, &c, 1, SQLITE_IOERR_WRITE);
 		clear_dirty(f);
 		ra_reset(f);
@@ -1645,6 +1659,10 @@ struct recover_ctx {
 	TxnPart parts[TXN_MAX_PARTS];
 	int nparts;
 	int all_present; // every intent found, so implicitly committed
+	// Whether every participant of the record was read. A group decided on a subset of its
+	// participants is a group decided on the wrong question: the missing one is exactly
+	// where an absent intent would be.
+	int complete;
 };
 
 // Read the participants of one record.
@@ -1654,6 +1672,7 @@ static fdb_error_t read_parts_body(FDBTransaction *tr, void *ctx, int *final) {
 	uint8_t from[KEYMAX], to[KEYMAX];
 
 	c->nparts = 0;
+	c->complete = 0;
 	int flen = key_txn_part_prefix(from, c->txnid);
 	int tlen = key_after(to, from, flen);
 
@@ -1667,17 +1686,24 @@ static fdb_error_t read_parts_body(FDBTransaction *tr, void *ctx, int *final) {
 		fdb_bool_t more;
 		err = fdb_future_get_keyvalue_array(f, &kv, &count, &more);
 		if (!err) {
-			for (int i = 0; i < count && c->nparts < TXN_MAX_PARTS; i++) {
+			int seen = 0;
+			for (int i = 0; i < count; i++) {
 				if (kv[i].value_length != 16) continue;
-				TxnPart *p = &c->parts[c->nparts];
 				int n = kv[i].key_length - flen;
 				if (n <= 0 || n >= MAX_NAME) continue;
+				seen++;
+				if (c->nparts >= TXN_MAX_PARTS) continue; // counted, and not stored
+				TxnPart *p = &c->parts[c->nparts];
 				memcpy(p->name, kv[i].key + flen, (size_t)n);
 				p->name[n] = '\0';
 				p->txid = get_be64(kv[i].value);
 				p->size = get_be64(kv[i].value + 8);
 				c->nparts++;
 			}
+			// Complete only when the read reached the end of the range and every row it
+			// found was stored. Either shortfall means the record has a participant this
+			// never looked at, and that is the one an absent intent would be hiding in.
+			c->complete = !more && seen == c->nparts;
 		}
 	}
 	fdb_future_destroy(f);
@@ -1872,9 +1898,14 @@ static fdb_error_t prevent_body(FDBTransaction *tr, void *ctx, int *final) {
 
 // Decide one staging record and carry the decision out.
 static int recover_one(uint64_t txnid) {
-	struct recover_ctx c = {txnid, {{{0}, 0, 0}}, 0, 1};
+	struct recover_ctx c = {txnid, {{{0}, 0, 0}}, 0, 1, 0};
 	int rc = run_txn(read_parts_body, &c, 0, SQLITE_IOERR_READ);
 	if (rc != SQLITE_OK) return rc;
+	if (!c.complete) {
+		// Leave it staging rather than decide it on a subset of its participants. A later
+		// pass can read the whole record; a wrong decision here is not recoverable.
+		return SQLITE_OK;
+	}
 	if (c.nparts == 0) {
 		// A record with no participants decides nothing and cannot be committed.
 		struct status_ctx s = {txnid, TXN_ABORTED};
@@ -1929,6 +1960,9 @@ static int recover_one(uint64_t txnid) {
 struct sweep_ctx {
 	uint64_t staging[TXN_MAX_RECOVER];
 	int n;
+	// Whether the scan reached the end of `weft/txn/`. A short answer is not the same as
+	// an exhausted one: FoundationDB returns what fitted and says `more`.
+	int complete;
 };
 
 // Every record still in the staging state. `weft/txn/NEXT` sorts under the same prefix and
@@ -1939,29 +1973,61 @@ static fdb_error_t sweep_body(FDBTransaction *tr, void *ctx, int *final) {
 	uint8_t from[KEYMAX], to[KEYMAX];
 
 	c->n = 0;
+	c->complete = 0;
 	int flen = key_txn_all(from);
 	int tlen = key_after(to, from, flen);
 
-	FDBFuture *f = fdb_transaction_get_range(tr, FDB_KEYSEL_FIRST_GREATER_OR_EQUAL(from, flen),
-	                                         FDB_KEYSEL_FIRST_GREATER_OR_EQUAL(to, tlen), 0, 0,
-	                                         FDB_STREAMING_MODE_WANT_ALL, 0, 0, 0);
-	fdb_error_t err = await(f);
-	if (!err) {
+	// The range holds a record's participants and the txid counter as well as its status,
+	// so it is far larger than the number of records, and a truncated answer is reachable.
+	// Following `more` is what stops a short answer being read as an exhausted one — and a
+	// record left undecided here is one `vfs_open` then raises a fence over, which is #13
+	// arriving by another door.
+	uint8_t begin[KEYMAX];
+	int blen = flen;
+	memcpy(begin, from, (size_t)flen);
+
+	const int suffix = 7; // "/STATUS"
+	fdb_error_t err = 0;
+
+	while (c->n < TXN_MAX_RECOVER) {
+		FDBFuture *f =
+		    fdb_transaction_get_range(tr, FDB_KEYSEL_FIRST_GREATER_OR_EQUAL(begin, blen),
+		                              FDB_KEYSEL_FIRST_GREATER_OR_EQUAL(to, tlen), 0, 0,
+		                              FDB_STREAMING_MODE_WANT_ALL, 0, 0, 0);
+		err = await(f);
+		if (err) {
+			fdb_future_destroy(f);
+			return err;
+		}
+
 		const FDBKeyValue *kv;
 		int count;
 		fdb_bool_t more;
 		err = fdb_future_get_keyvalue_array(f, &kv, &count, &more);
-		if (!err) {
-			const int suffix = 7; // "/STATUS"
-			for (int i = 0; i < count && c->n < TXN_MAX_RECOVER; i++) {
-				if (kv[i].key_length != flen + 8 + suffix) continue;
-				if (memcmp(kv[i].key + flen + 8, "/STATUS", (size_t)suffix) != 0) continue;
-				if (kv[i].value_length != 1 || kv[i].value[0] != TXN_STAGING) continue;
-				c->staging[c->n++] = get_be64(kv[i].key + flen);
-			}
+		if (err) {
+			fdb_future_destroy(f);
+			return err;
 		}
+
+		for (int i = 0; i < count && c->n < TXN_MAX_RECOVER; i++) {
+			if (kv[i].key_length != flen + 8 + suffix) continue;
+			if (memcmp(kv[i].key + flen + 8, "/STATUS", (size_t)suffix) != 0) continue;
+			if (kv[i].value_length != 1 || kv[i].value[0] != TXN_STAGING) continue;
+			c->staging[c->n++] = get_be64(kv[i].key + flen);
+		}
+
+		if (!more || count == 0) {
+			fdb_future_destroy(f);
+			c->complete = 1;
+			break;
+		}
+
+		blen = kv[count - 1].key_length;
+		if (blen > KEYMAX - 1) blen = KEYMAX - 1;
+		memcpy(begin, kv[count - 1].key, (size_t)blen);
+		begin[blen++] = 0x00;
+		fdb_future_destroy(f);
 	}
-	fdb_future_destroy(f);
 	return err;
 }
 
@@ -1976,7 +2042,7 @@ static fdb_error_t sweep_body(FDBTransaction *tr, void *ctx, int *final) {
 // reach is idempotent, which is the property that lets any finder of a record decide it.
 int weft_txn_recover(void) {
 	for (;;) {
-		struct sweep_ctx c = {{0}, 0};
+		struct sweep_ctx c = {{0}, 0, 0};
 		int rc = run_txn(sweep_body, &c, 0, SQLITE_IOERR_READ);
 		if (rc != SQLITE_OK) return rc;
 		if (c.n == 0) return SQLITE_OK;
@@ -1985,9 +2051,10 @@ int weft_txn_recover(void) {
 			rc = recover_one(c.staging[i]);
 			if (rc != SQLITE_OK) return rc;
 		}
-		// A full sweep may have been truncated, so go round again until one comes back
-		// empty. Each pass strictly removes records, so this ends.
-		if (c.n < TXN_MAX_RECOVER) return SQLITE_OK;
+		// Go round again unless this pass both filled no buffer and reached the end of the
+		// range. A short answer alone proves nothing, because it may have been truncated.
+		// Each pass strictly removes records, so this ends.
+		if (c.n < TXN_MAX_RECOVER && c.complete) return SQLITE_OK;
 	}
 }
 
@@ -2087,7 +2154,16 @@ static int vfs_open(sqlite3_vfs *vfs, const char *name, sqlite3_file *file, int 
 	memset(f, 0, sizeof(*f));
 	f->base.pMethods = &FDB_IO;
 	f->trunc_pages = -1;
-	snprintf(f->name, MAX_NAME, "%s", name ? name : "anonymous");
+
+	// A name too long to hold is refused rather than cut down. Truncating it would give two
+	// different databases the same name, and therefore the same keys: one actor's pages
+	// would answer another's reads, with nothing anywhere reporting it.
+	//
+	// This is the same fault as every other one in this file's history — a short answer
+	// accepted as a complete one — and the same answer: say so instead.
+	const char *want = name ? name : "anonymous";
+	if (strlen(want) >= MAX_NAME) return SQLITE_CANTOPEN;
+	snprintf(f->name, MAX_NAME, "%s", want);
 
 	// Decide every staging group before this open raises a fence.
 	//
