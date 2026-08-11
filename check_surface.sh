@@ -47,6 +47,18 @@ nm -u --format=posix "$lib" | awk '$2 == "U" && $1 ~ /^fdb_/ { print $1 }' \
 # What we said it would.
 sed 's/#.*//' "$allow" | tr -d ' \t' | grep -v '^$' | sort -u > "$work/allowed"
 
+# A library with no FoundationDB in it at all is not a clean surface. It is a check with
+# nothing to check, which is the failure `ci.yml` already guards its crash points against:
+# a green step that asserted nothing. This becomes reachable the moment the FoundationDB
+# backend is optional at build time, and reporting it as nineteen stale entries would bury
+# the cause under the symptom.
+if [ ! -s "$work/actual" ]; then
+	echo "check_surface: $lib references no FoundationDB symbols at all."
+	echo "  Either the backend was not built into it, or this is the wrong library."
+	echo "  Nothing was checked, so this is a failure and not a pass."
+	exit 1
+fi
+
 rc=0
 
 # A symbol used and not listed. This is the one that matters: it is a feature entering the
