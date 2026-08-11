@@ -1686,13 +1686,20 @@ static fdb_error_t read_parts_body(FDBTransaction *tr, void *ctx, int *final) {
 		fdb_bool_t more;
 		err = fdb_future_get_keyvalue_array(f, &kv, &count, &more);
 		if (!err) {
-			int seen = 0;
+			// Count every row in the range, not every row that passed a check.
+			//
+			// Skipping a malformed row before counting it is the same fault one level
+			// down: the row is a participant this cannot read, and dropping it quietly
+			// makes the list look complete while the participant it could not parse is
+			// exactly where an absent intent would be. A row that does not look like a
+			// participant row is a reason to stop, not to look away.
+			int rows = 0;
 			for (int i = 0; i < count; i++) {
+				rows++;
 				if (kv[i].value_length != 16) continue;
 				int n = kv[i].key_length - flen;
 				if (n <= 0 || n >= MAX_NAME) continue;
-				seen++;
-				if (c->nparts >= TXN_MAX_PARTS) continue; // counted, and not stored
+				if (c->nparts >= TXN_MAX_PARTS) continue;
 				TxnPart *p = &c->parts[c->nparts];
 				memcpy(p->name, kv[i].key + flen, (size_t)n);
 				p->name[n] = '\0';
@@ -1701,9 +1708,9 @@ static fdb_error_t read_parts_body(FDBTransaction *tr, void *ctx, int *final) {
 				c->nparts++;
 			}
 			// Complete only when the read reached the end of the range and every row it
-			// found was stored. Either shortfall means the record has a participant this
-			// never looked at, and that is the one an absent intent would be hiding in.
-			c->complete = !more && seen == c->nparts;
+			// saw became a participant. Either shortfall means the record has a member
+			// this did not read.
+			c->complete = !more && rows == c->nparts;
 		}
 	}
 	fdb_future_destroy(f);
@@ -1715,6 +1722,21 @@ static fdb_error_t read_parts_body(FDBTransaction *tr, void *ctx, int *final) {
 // staged page has an index row, which `spec/ParallelCommit.lean` states as
 // `resolve_is_honest_when_it_covers_everything`.
 #define TXN_MAX_RESOLVE_PAGES 65536
+
+// The other direction of the same rule, and the one that bites as a hang rather than a
+// wrong answer: recovery must never refuse a commit that is complete.
+//
+// `resolve_body` refuses when the enumeration did not reach the end, which is right when
+// the read was cut short and a dead end when the commit simply cannot fit. Such a group is
+// implicitly committed and permanently unresolvable: the record stays staging, and every
+// open retries it forever.
+//
+// It cannot happen while a participant stages in one transaction, because that bounds a
+// commit far below this. Asserted rather than believed, since both numbers are derived and
+// either could move.
+_Static_assert(TXN_MAX_RESOLVE_PAGES >= ONE_TXN_PAGES,
+               "a commit that can be staged must be one recovery can enumerate, or a group "
+               "can be implicitly committed and never resolvable");
 
 struct intent_ctx {
 	const TxnPart *part;
