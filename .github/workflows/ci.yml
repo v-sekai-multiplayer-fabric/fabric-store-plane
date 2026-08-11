@@ -71,21 +71,36 @@ jobs:
       - name: A commit past one transaction
         run: ./build/prove_big_commit big.db 2000 8192
 
-      # A crash must leave the whole commit or none of it. Walk the first crash points
-      # rather than one, since the fault this looks for lives at a particular point and a
-      # single delay rarely lands inside a commit. The full space is the Lean search in
-      # witness/, which is too long for a pull request.
+      # A crash must leave the whole commit or none of it. Walk crash points rather than
+      # one, since the fault lives at a particular point and a single delay rarely lands
+      # inside a commit. The full space is the Lean search in witness/, too long for a
+      # pull request.
+      #
+      # The points start past the setup. A writer drops the table, creates it, and seeds
+      # it before the first round, so a crash below about commit 6 lands in setup and
+      # leaves a database with no rows, where nothing can be torn. Points 1 to 5 passed
+      # here and tested nothing, so the step now starts above them and fails if it never
+      # reaches a seeded database. A green step that asserted nothing is the failure this
+      # suite exists to avoid.
       - name: A crash leaves no torn commit
         run: |
-          for point in 1 2 3 5 8 13; do
+          seeded=0
+          for point in 6 8 10 13 16 21; do
             echo "=== crash before commit $point ==="
             # Exit 2 means the crash point was past the end of the sequence, which is not
             # a fault, so the status has to be captured rather than left to abort the step.
             rc=0
-            ./build/prove_crash "crash-$point.db" 400 at "$point" || rc=$?
+            out=$(./build/prove_crash "crash-$point.db" 400 at "$point" 2>&1) || rc=$?
+            echo "$out"
             # 0 whole, 2 unreached, 1 torn or a failed integrity check.
             if [ "$rc" = 1 ]; then echo "torn at crash point $point"; exit 1; fi
+            case "$out" in *"rows: 0"*) ;; *"rows: "*) seeded=$((seeded + 1)) ;; esac
           done
+          echo "crash points that reached a seeded database: $seeded"
+          if [ "$seeded" = 0 ]; then
+            echo "every crash point landed in setup, so this step asserted nothing"
+            exit 1
+          fi
 
   fuzz:
     runs-on: ubuntu-24.04
