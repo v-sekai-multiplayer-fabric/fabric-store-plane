@@ -169,11 +169,23 @@ static int check(const char *world_name, const char *avatar_name, int grants) {
 	printf("world %d + avatar %d = %d, expected %d\n", remaining, held, remaining + held,
 	       grants);
 
+	// Conservation only describes a seeded world. A crash during setup leaves the tables
+	// made and the seed not landed, and then there is nothing to conserve: the sum is zero
+	// because no item ever existed, which is not a partial grant.
+	//
+	// A half seeded world cannot happen, because the seed is one SQLite commit and
+	// `prove_crash` is the program that establishes those land whole or not at all. So the
+	// sum is zero or it is `grants`, and any other value is an item that went missing or
+	// got duplicated between the two databases.
 	int bad = 0;
-	if (remaining + held != grants) {
+	if (remaining + held == 0) {
+		printf("unseeded: the crash landed in setup, so there was nothing to conserve\n");
+	} else if (remaining + held != grants) {
 		// One item is in both places or in neither, which is a grant that half happened.
 		printf("PARTIAL: %d items accounted for, expected %d\n", remaining + held, grants);
 		bad = 1;
+	} else {
+		printf("conserved: %d items, every grant whole\n", grants);
 	}
 
 	// Both databases are structurally fine either way, which is the point of checking the
