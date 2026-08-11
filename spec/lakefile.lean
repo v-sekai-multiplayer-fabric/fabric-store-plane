@@ -6,4 +6,4 @@ package «weft-storeplane-spec» where
   -- nobody checks.
 
 @[default_target] lean_lib «Spec» where
-  roots := #[`ReadAhead, `ParallelCommit]
+  roots := #[`ReadAhead, `ParallelCommit, `Backend]

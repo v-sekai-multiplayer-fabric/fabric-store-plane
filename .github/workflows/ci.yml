@@ -54,6 +54,12 @@ jobs:
           cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
           cmake --build build -j
 
+      # The plane calls the FoundationDB surface it says it calls, and every read is
+      # serializable. `foundationdb.allow` is the list and says why each absence is one.
+      # This needs no cluster: it reads the built library's undefined symbols.
+      - name: The store surface is the one that was argued for
+        run: ./check_surface.sh build
+
       # A handoff copies nothing. The reader is a different process with no local file, so
       # this fails if the VFS ever writes one.
       - name: A handoff copies nothing
