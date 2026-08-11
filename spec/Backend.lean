@@ -202,13 +202,27 @@ def complete : Backend where
 /-- A backend whose range reads may come back short.
 
 This is FoundationDB. A transaction is capped at 10 MB, so a range over a megabyte of pages
-answers with what fitted and sets `more`. `fits` is what fitted, and `more` is `true`
-because the backend cannot promise otherwise — which is the correct thing for it to say. -/
-def truncating (fits : Key → Bool) : Backend where
+answers with what fitted and sets `more`. `fits` is which keys came back, and `cutShort` is
+whether this particular range was cut — the flag the C actually reads.
+
+An earlier version of this model set `more` unconditionally. That made `range_is_complete`
+vacuous, and it said something false: FoundationDB *does* promise it covered the range when
+it does not set `more`, and the C is entitled to rely on that. Modelling the flag as always
+true would have let a backend that never covers anything satisfy the laws, which is not a
+store the layout could run on. `honest` below ties the two together, so the law is carried
+rather than dodged. -/
+def truncating (fits : Key → Bool) (cutShort : Key → Key → Bool) : Backend where
   get := complete.get
-  getRange := fun _ lo hi _ _ => { covered := fun k => inRange lo hi k && fits k, more := true }
+  getRange := fun _ lo hi _ _ =>
+    { covered := fun k => inRange lo hi k && fits k, more := cutShort lo hi }
   set := complete.set
   clearRange := complete.clearRange
+
+/-- What a range read has to mean by not setting `more`: everything in the range came back.
+That is the whole content of the flag, and it is the obligation `query_intent_body` drops
+when it stops at 4096 rows without looking. -/
+def honest (fits : Key → Bool) (cutShort : Key → Key → Bool) : Prop :=
+  ∀ lo hi k, cutShort lo hi = false → inRange lo hi k = true → fits k = true
 
 theorem complete_is_lawful : Laws complete := by
   constructor
@@ -220,16 +234,39 @@ theorem complete_is_lawful : Laws complete := by
   · intro _ _ _ _ _ _ h; exact h
   · intro _ _ _ _ _ _ _ h _; exact h
 
-theorem truncating_is_lawful (fits : Key → Bool) : Laws (truncating fits) := by
+theorem truncating_is_lawful (fits : Key → Bool) (cutShort : Key → Key → Bool)
+    (h : honest fits cutShort) : Laws (truncating fits cutShort) := by
   constructor
   · intro _ _; rfl
   · intro _ k _; simp [truncating, complete]
   · intro _ k _ j hj; simp [truncating, complete, hj]
   · intro _ _ _ k hk; simp [truncating, complete, hk]
   · intro _ _ _ k hk; simp [truncating, complete, hk]
-  · intro _ _ _ _ _ _ h; simp [truncating] at h; exact h.1
-  -- `more` is `true`, so completeness is vacuous. That is the whole difference.
-  · intro _ _ _ _ _ _ h; simp [truncating] at h
+  · intro _ _ _ _ _ _ hk; simp [truncating] at hk; exact hk.1
+  -- Not vacuous any more: `honest` is what carries it.
+  · intro _ lo hi _ _ k hm hin _
+    simp only [truncating] at hm ⊢
+    simp [hin, h lo hi k hm hin]
+
+/-- **The flag is not decoration.** When the read did cut short, a key that is in the range
+and in the store can still be missing from what came back — which is exactly the state
+`ReadAhead.ignoring_more_loses_a_page` turns into a wrong page.
+
+`fitsBelowFive` is a read that got through the first few keys and stopped. -/
+def fitsBelowFive : Key → Bool := fun k => lexLt k [5]
+
+theorem cut_short_really_loses_a_key :
+    ((truncating fitsBelowFive (fun _ _ => true)).getRange
+      ⟨fun _ => some []⟩ [0] [9] 0 false).covered [7] = false := by
+  decide
+
+/-- And the same read, uncut, covers it. So the two backends differ on this one fact and
+agree on everything else, which is what makes the hypothesis in `resolve_is_honest` the
+whole content of the difference. -/
+theorem uncut_covers_it :
+    ((truncating (fun _ => true) (fun _ _ => false)).getRange
+      ⟨fun _ => some []⟩ [0] [9] 0 false).covered [7] = true := by
+  decide
 
 /-! ## Transport: the store's laws are what the protocol was assuming
 
