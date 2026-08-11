@@ -1,8 +1,10 @@
 # fabric-store-plane
 
-The store plane is a native process. SQLite runs inside it with a custom VFS, and that VFS
-reads and writes pages in FoundationDB. The BEAM reaches the plane over Eclipse iceoryx2.
-The plane reaches FoundationDB with the native client, `libfdb_c`.
+An actor's database with no local file.
+
+SQLite runs inside a native process with a custom VFS, and that VFS reads and writes pages
+in FoundationDB. The BEAM reaches the plane over Eclipse iceoryx2, and the plane reaches
+FoundationDB with the native client, `libfdb_c`.
 
 ```
 BEAM control plane
@@ -14,9 +16,8 @@ store plane (native)
 FoundationDB
 ```
 
-There is no local file, so an actor's database moves between machines with no copy and no
-restore step. That is the property the whole design rests on, and `prove_handoff.c` is it
-on its own:
+Because there is no file, a handoff copies nothing. One process writes, and another
+machine opens the same database and reads pages, with no restore step and no transfer:
 
 ```
 === process A: write ===
@@ -29,10 +30,8 @@ ls: cannot access 'zone-atlantis.db': No such file or directory
 read 3 rows from zone-atlantis.db in a new process, nothing was copied
 ```
 
-`thirdparty/harness` is
-[`fabric-harness`](https://github.com/v-sekai-multiplayer-fabric/fabric-harness), pulled
-in as a subtree. It carries the iceoryx2 C ABI and the shared limits, and this plane links
-it rather than linking iceoryx2.
+A large actor moves as fast as a small one, and an actor is no longer limited by memory.
+That is what the plane is for.
 
 ## State
 
@@ -40,67 +39,38 @@ The VFS is built. A commit is one FoundationDB transaction, and reads, writes, c
 and the fence run against a live cluster.
 
 The plane itself is not built. The bus works and the loop that sits on it does not, so
-nothing calls this VFS except the programs beside it.
+nothing calls this VFS except the programs beside it. What is unbuilt and what is proposed
+are in the [issues](https://github.com/v-sekai-multiplayer-fabric/fabric-store-plane/issues).
 
-Everything proposed and everything unbuilt is in the
-[issues](https://github.com/v-sekai-multiplayer-fabric/fabric-store-plane/issues):
-read-ahead, pins, the index bound on a very large commit, many writers committing at once,
-the plane process itself, and deleting the Elixir prototype it replaces.
+## Build and run
 
-## Where the design is written down
-
-Every rule sits beside the code it governs, so this file does not repeat it.
-
-| what | where |
-| --- | --- |
-| the key layout, and why a read touches two rows | `fdb_vfs.c`, the file comment |
-| what a caller must set, and why | `fdb_vfs.c`, the file comment |
-| the commit protocol, and the staging path a large commit takes | `flush` in `fdb_vfs.c` |
-| the compaction rules and the ratio that triggers them | the compaction section of `fdb_vfs.c` |
-| the fence, and what two writers did without one | `prove_concurrency.c`, and `check_fence` |
-| why a crash point beats a delay | `prove_crash.c` |
-| what the crash search covers, and what it found | `witness/CrashSearch.lean` |
-| the measured numbers, and what they mean for the design | `bench_vfs.c` |
-| the retry loop every transaction runs in | `run_txn` in `fdb_vfs.c` |
-
-The proofs are weft's. `docs/spec/Store.lean` holds the layout and the compaction rules,
-`docs/spec/Prefetch.lean` holds read-ahead, and `docs/logbook/store_plane.md` holds every
-measured number with the cluster and the settings that produced it.
-
-## Build
-
-The build needs the FoundationDB client and SQLite headers.
+The build needs the FoundationDB client and SQLite headers. The `Containerfile` carries
+both, and is the reproducible path.
 
 ```
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
-The `Containerfile` carries both, and is the reproducible path:
-
-```
-podman build -t fabric-store-plane .
-```
-
-## Run
-
-Every program takes the cluster file from `WEFT_FDB_CLUSTER_FILE` and needs a live
-FoundationDB.
+Every program needs a live FoundationDB and takes the cluster file from the environment.
+Each one prints its own usage. Start with the handoff, which is the output above:
 
 ```
 export WEFT_FDB_CLUSTER_FILE=/etc/foundationdb/fdb.cluster
-
-./build/prove_handoff write zone-atlantis.db   # then read, in a new process
-./build/prove_crash crash.db 400 at 7          # crash before the 7th commit
-./build/prove_concurrency one.db 1 300         # two writers, one database
-./build/prove_big_commit big.db 2000 8192      # a commit past one transaction
-./build/integrity zone-atlantis.db             # SQLite's own audit
-./build/bench_vfs 1000                         # against a local file
+./build/prove_handoff write zone-atlantis.db
+./build/prove_handoff read zone-atlantis.db
 ```
 
-`soak.sh` runs the load, kill, and crash rounds in turn, and reports which round failed
-and what it printed rather than a count. Point `BIN` at the build directory:
+`BIN=build ./soak.sh 3600` runs the load, kill, and crash rounds in turn.
 
-```
-BIN=build ./soak.sh 3600
-```
+## Reading the code
+
+Start at the file comment in `fdb_vfs.c`. It holds the key layout, what a caller must set,
+and how a commit is made atomic; the rest of the design sits beside the code it governs,
+and each program says in its own header what it proves and why that question is worth
+asking.
+
+The proofs and the numbers are weft's, in `docs/spec/` and `docs/logbook/`.
+`thirdparty/harness` is
+[`fabric-harness`](https://github.com/v-sekai-multiplayer-fabric/fabric-harness) as a
+subtree, and carries the iceoryx2 C ABI and the shared limits.
