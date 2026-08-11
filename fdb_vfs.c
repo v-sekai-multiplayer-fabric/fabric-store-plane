@@ -1406,14 +1406,69 @@ static fdb_error_t record_body(FDBTransaction *tr, void *ctx, int *final) {
 
 static int txn_resolve_group(uint64_t txnid, int drop_record);
 
-// Give up a group that was begun and not committed. No record was ever written, so there
-// is nothing to decide: the staged pages are unreachable and the next recovery sweep will
-// not even see them, because a group with no record is not a group.
+struct discard_ctx {
+	FdbFile *f;
+	uint64_t txid;
+};
+
+// Throw away what one participant staged for a group that is being given up.
+//
+// This is what keeps "anything under this txid is this group's" true. A participant stages
+// under `head + 1`, and a group that never committed moved no head, so the next group
+// stages under the same txid. Left behind, a dead group's pages answer the next group's
+// intent check and the two groups' writes commit as one.
+static fdb_error_t discard_body(FDBTransaction *tr, void *ctx, int *final) {
+	(void)final;
+	struct discard_ctx *c = ctx;
+	uint8_t from[KEYMAX], to[KEYMAX];
+	int flen = key_delta_txid(from, c->f->name, c->txid);
+	int tlen = key_after(to, from, flen);
+	fdb_transaction_clear_range(tr, from, flen, to, tlen);
+	return 0;
+}
+
+// Give up every participant's intent. Safe to run when a participant staged nothing, since
+// then its recorded txid is its head and the range is one nobody wrote.
+static void txn_discard_group(void) {
+	for (int i = 0; i < g_group.nparts; i++) {
+		FdbFile *f = g_group.files[i];
+		if (g_group.txids[i] <= f->head) continue; // nothing was staged under it
+		struct discard_ctx c = {f, g_group.txids[i]};
+		(void)run_txn(discard_body, &c, 1, SQLITE_IOERR_WRITE);
+		clear_dirty(f);
+		ra_reset(f);
+	}
+}
+
+// Give up a group that was begun and not committed.
+//
+// No record was ever written, so there is nothing to decide, and recovery will never see
+// this group: a group with no record is not a group. That is exactly why the pages have to
+// go now. Nothing else will ever collect them, and the next group stages under the same
+// txid, so leaving them lets a dead group's writes be read as the next group's intent.
 //
 // This exists because `weft_txn_begin` takes the lock and only a commit gives it back. A
 // caller whose stage fails has to be able to let go, or the next group waits forever.
 int weft_txn_abort(uint64_t txnid) {
 	if (!g_group.open || g_group.txnid != txnid) return SQLITE_MISUSE;
+
+	// A group can only be given up before a participant has staged.
+	//
+	// Staging happens when SQLite ends a transaction, and by then SQLite considers those
+	// pages written and holds them in its own cache. With locking_mode=EXCLUSIVE it trusts
+	// that cache, so nothing done to FoundationDB afterwards makes it forget: the next
+	// commit would carry the abandoned pages forward under a later group. The VFS cannot
+	// roll back a cache it does not own.
+	//
+	// So a caller wraps a group in an explicit SQLite transaction and gives it up with
+	// ROLLBACK, which never reaches the VFS at all. Reaching here after a participant has
+	// staged is a caller that committed and then changed its mind, and the honest answer is
+	// that it cannot.
+	for (int i = 0; i < g_group.nparts; i++) {
+		if (g_group.txids[i] > g_group.files[i]->head) return SQLITE_MISUSE;
+	}
+
+	txn_discard_group();
 	for (int i = 0; i < g_group.nparts; i++) g_group.files[i]->group_txnid = 0;
 	g_group.open = 0;
 	g_group.nparts = 0;
@@ -1427,6 +1482,9 @@ int weft_txn_commit(uint64_t txnid) {
 	struct record_ctx c = {txnid};
 	int rc = run_txn(record_body, &c, 1, SQLITE_IOERR_WRITE);
 	if (rc != SQLITE_OK) {
+		// The record never landed, so this group did not commit and never will. Its pages
+		// are in the way of the next group's, for the same reason as in `weft_txn_abort`.
+		txn_discard_group();
 		for (int i = 0; i < g_group.nparts; i++) g_group.files[i]->group_txnid = 0;
 		g_group.open = 0;
 		pthread_mutex_unlock(&g_group_lock);
@@ -1590,12 +1648,22 @@ static fdb_error_t read_parts_body(FDBTransaction *tr, void *ctx, int *final) {
 	return err;
 }
 
+// How many staged pages one participant may carry. A commit larger than this cannot be
+// resolved, and saying so is the point: `resolve_body` may only move a head once every
+// staged page has an index row, which `spec/ParallelCommit.lean` states as
+// `resolve_is_honest_when_it_covers_everything`.
+#define TXN_MAX_RESOLVE_PAGES 65536
+
 struct intent_ctx {
 	const TxnPart *part;
 	int present;
 	uint64_t head;
-	uint32_t pgno[4096];
+	uint32_t pgno[TXN_MAX_RESOLVE_PAGES];
 	int npages;
+	// Whether the enumeration reached the end of the commit. A range read answers with what
+	// fitted and sets `more`, and a resolve that trusted a truncated answer would index the
+	// pages it saw, move the head, and leave the rest reading their pre-commit version.
+	int complete;
 };
 
 // QueryIntent. A participant staged in one transaction, so its pages are all there or
@@ -1622,31 +1690,69 @@ static fdb_error_t query_intent_body(FDBTransaction *tr, void *ctx, int *final) 
 		// Already resolved, or the participant wrote nothing. Either way there is no
 		// intent left to be missing.
 		c->present = 1;
+		c->complete = 1;
 		return 0;
 	}
 
+	// Read the whole of `DELTA/<txid>/`, following `more` rather than believing the first
+	// answer. FoundationDB returns what fitted; a commit of any size is several answers.
 	int flen = key_delta_txid(from, c->part->name, c->part->txid);
 	int tlen = key_after(to, from, flen);
-	FDBFuture *f = fdb_transaction_get_range(tr, FDB_KEYSEL_FIRST_GREATER_OR_EQUAL(from, flen),
-	                                         FDB_KEYSEL_FIRST_GREATER_OR_EQUAL(to, tlen), 0, 0,
-	                                         FDB_STREAMING_MODE_WANT_ALL, 0, 0, 0);
-	err = await(f);
-	if (!err) {
+
+	uint8_t begin[KEYMAX];
+	int blen = flen;
+	memcpy(begin, from, (size_t)flen);
+	c->complete = 0;
+
+	for (;;) {
+		FDBFuture *f =
+		    fdb_transaction_get_range(tr, FDB_KEYSEL_FIRST_GREATER_OR_EQUAL(begin, blen),
+		                              FDB_KEYSEL_FIRST_GREATER_OR_EQUAL(to, tlen), 0, 0,
+		                              FDB_STREAMING_MODE_WANT_ALL, 0, 0, 0);
+		err = await(f);
+		if (err) {
+			fdb_future_destroy(f);
+			return err;
+		}
+
 		const FDBKeyValue *kv;
 		int count;
 		fdb_bool_t more;
 		err = fdb_future_get_keyvalue_array(f, &kv, &count, &more);
-		if (!err) {
-			for (int i = 0; i < count && c->npages < 4096; i++) {
-				if (kv[i].key_length < 4) continue;
-				const uint8_t *p = kv[i].key + kv[i].key_length - 4;
-				c->pgno[c->npages++] = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16)
-				                       | ((uint32_t)p[2] << 8) | (uint32_t)p[3];
-			}
-			c->present = count > 0;
+		if (err) {
+			fdb_future_destroy(f);
+			return err;
 		}
+
+		for (int i = 0; i < count; i++) {
+			if (kv[i].key_length < 4) continue;
+			if (c->npages >= TXN_MAX_RESOLVE_PAGES) {
+				// Too large to resolve. Leaving `complete` clear is what stops the head
+				// moving over the pages this never saw.
+				fdb_future_destroy(f);
+				c->present = 1;
+				return 0;
+			}
+			const uint8_t *p = kv[i].key + kv[i].key_length - 4;
+			c->pgno[c->npages++] = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16)
+			                       | ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+		}
+
+		if (!more || count == 0) {
+			fdb_future_destroy(f);
+			c->complete = 1;
+			break;
+		}
+
+		// Continue after the last key this answer carried.
+		blen = kv[count - 1].key_length;
+		if (blen > KEYMAX - 1) blen = KEYMAX - 1;
+		memcpy(begin, kv[count - 1].key, (size_t)blen);
+		begin[blen++] = 0x00; // the first key strictly after it
+		fdb_future_destroy(f);
 	}
-	fdb_future_destroy(f);
+
+	c->present = c->npages > 0;
 	return err;
 }
 
@@ -1654,11 +1760,22 @@ static fdb_error_t query_intent_body(FDBTransaction *tr, void *ctx, int *final) 
 // move its size and its head. This is `put_head` without an FdbFile, because recovery has
 // no open handle to work from.
 static fdb_error_t resolve_body(FDBTransaction *tr, void *ctx, int *final) {
-	(void)final;
 	struct intent_ctx *c = ctx;
 	uint8_t key[KEYMAX];
 
 	if (c->part->txid <= c->head) return 0; // somebody resolved it first
+
+	// A head may only move once every staged page has an index row. If the enumeration did
+	// not reach the end of the commit, the pages it never saw would keep no index row while
+	// the head said the commit landed, and a read would find their pre-commit version — a
+	// page that is stale rather than missing, so nothing detects it.
+	//
+	// Refusing leaves the record staging for a later pass. That is the safe direction: the
+	// group is already implicitly committed, and it stays so until somebody can finish it.
+	if (!c->complete) {
+		*final = SQLITE_IOERR_WRITE;
+		return 0;
+	}
 
 	for (int i = 0; i < c->npages; i++) {
 		int klen = key_pidx(key, c->part->name, c->pgno[i]);
