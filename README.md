@@ -22,14 +22,13 @@ FoundationDB
 State: the VFS is built, and it holds the layout below. A commit is one FoundationDB
 transaction. Reads, writes, compaction, and the fence run against a live cluster. The
 plane itself is not built. The bus works, and the loop that sits on it does not.
-`native/harness` passes a message between two processes over iceoryx2, and
-`harness.md` records it. There is no thread-per-core loop yet, so nothing calls this VFS
-except the programs in `native/storeplane/`.
+`thirdparty/harness` passes a message between two processes over iceoryx2, and its README
+records the run. There is no thread-per-core loop yet, so nothing calls this VFS except
+the programs beside it.
 
-The Elixir prototype, `Weft.Actor.Store.Replicated` and `.Replicator`, still exists. It
-is not this design. It uses SQLite as a key and value table, it replicates logical rows
-rather than pages, and `Weft.Actor.load_all` reads the whole actor into memory when the
-actor starts.
+What is not built and what is proposed is in the
+[issues](https://github.com/v-sekai-multiplayer-fabric/fabric-store-plane/issues). This
+file describes what the code does.
 
 ## Why a VFS
 
@@ -57,38 +56,10 @@ rivet's Depot layout, modelled in weft's `docs/spec/Store.lean`:
 weft's `docs/spec/Store.lean` proves that compaction preserves every read, that the in-place fold
 loses a page, and that a read touches two rows whatever the log holds.
 
-## Read-ahead is the engineering
-
-A page miss is a network round trip, so a VFS over FoundationDB lives or dies on
-read-ahead. rivet's VFS is 3473 lines, and most of it is this.
-
-It does not pick a depth. It scores the access pattern:
-
-```
-forward page, gap of 8 or less   score + 2, capped at 12
-random page, a scan is running   score - 1
-random page, no scan             score - 4
-score of 6 or more               escalate read-ahead
-score of 10 or more              full depth, 256 pages or 1 MB
-```
-
-Up 2 and down 4 means a scan must be twice as consistent as the noise to hold its
-credit. The softer decay while a scan runs tolerates the interleaving that a real
-B-tree walk gives. So a point read pays for no read-ahead, and a table scan escalates
-after three pages. Neither is configured.
-
-rivet also keeps one tracker for each page class, B-tree and overflow, because a scan
-over rows with large payloads reads a leaf, then an overflow page, then the next leaf.
-One tracker sees alternating jumps and never scores a scan.
-
-`../spec/Prefetch.lean` proves the behaviours: a scan escalates in three pages, random
-access never escalates, the score is capped, a gap inside the tolerance is still a scan,
-and one tracker misses the interleaved scan that two trackers find.
-
 ## What is built
 
-`native/storeplane/` holds a SQLite VFS whose files live in FoundationDB, and a program
-that proves the property the decision rests on.
+`fdb_vfs.c` is a SQLite VFS whose files live in FoundationDB, and `prove_handoff.c`
+proves the property the decision rests on.
 
 ```
 === process A: write ===
@@ -147,7 +118,8 @@ base. A ratio has no units to tune, and it moves with the load. A quiet actor ne
 compacts.
 
 Retention follows demand. A shard version below the oldest pin is one that nobody can
-read, so compaction drops it. Nothing writes a pin yet.
+read, so compaction drops it. Nothing writes a pin, so only the newest version survives
+(#2).
 
 Locking is a no-op, because an actor is the single writer of its own store.
 
@@ -257,35 +229,9 @@ both now retry.
 A fence mismatch does not retry. Refusing the write is the correct answer, so it reaches
 the caller as `SQLITE_READONLY`.
 
-## What is not handled
+## Open work
 
-- **There is no read-ahead.** A page miss is a network round trip, and the section above
-  says read-ahead is most of the engineering. `../spec/Prefetch.lean` models it. The VFS
-  reads one page at a time.
-- **Nothing writes a pin.** Compaction reads the pin range and keeps every version at or
-  above the oldest pin. No reader creates one, so only the newest version survives, and
-  a read below the head has nothing to hold.
-- **A very large commit cannot be indexed.** The pages of a large commit stage across
-  transactions. The index rows must still fit one transaction. The limit comes from the
-  FoundationDB transaction size, and it is not chosen.
-- **One writer commits, not many.** The fence gives one owner at a time. Committing from
-  several actors at once needs the parallel commit protocol, modelled in
-  [ParallelCommits.tla][pc]. That is a different problem from the one the fence solves.
-
-[pc]: https://github.com/V-Sekai/cockroach/blob/release-22.1-v-sekai/docs/tla-plus/ParallelCommits/ParallelCommits.tla
-
-## Next
-
-1. Add read-ahead, which `../spec/Prefetch.lean` already models. This is the largest
-   remaining piece, and it is what makes a scan affordable.
-2. Build the plane on the thread-per-core harness over iceoryx2, per weft's `lib/weft.ex`. Nothing
-   calls the VFS yet except the programs in `native/storeplane/`.
-3. Write a pin when a read needs a version below the head, so a restore point survives
-   compaction.
-4. Delete `Weft.Actor.Store.Replicated`, `.Replicator`, and `Weft.Actor.load_all` when the
-   plane serves reads.
-
-## What this blocks
-
-`Weft.Actor.load_all` reads the whole actor into memory, so an actor is memory-sized
-until this plane exists. Every limit above kilobytes waits on it.
+Every proposal and everything unbuilt lives in the
+[issues](https://github.com/v-sekai-multiplayer-fabric/fabric-store-plane/issues):
+read-ahead, pins, the index bound on a very large commit, many writers committing at
+once, the plane process itself, and deleting the Elixir prototype it replaces.
