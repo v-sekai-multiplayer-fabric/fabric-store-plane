@@ -101,6 +101,10 @@ static inline int key_prefix(uint8_t *out, const char *name, const char *what) {
 #define TXN_STAGING 1
 #define TXN_COMMITTED 2
 #define TXN_ABORTED 3
+// A record that cannot be decided and never will be. Not a decision — the group may have
+// committed or not, and nothing here can tell — but a state the sweep stops retrying, so
+// one unreadable record does not cost every open forever.
+#define TXN_STUCK 4
 
 static inline int key_txn_status(uint8_t *out, uint64_t txnid) {
 	int n = snprintf((char *)out, KEYMAX, "weft/txn/");
@@ -127,6 +131,26 @@ static inline int key_txn_prefix(uint8_t *out, uint64_t txnid) {
 }
 
 // Every transaction record, so recovery can sweep for the staging ones.
+// A group that names this database, from this database's side.
+//
+//   weft/db/<name>/INFLIGHT/<txnid>
+//
+// Recovery has to decide any group naming a database before that database's fence goes up,
+// or it prevents a commit that already happened. Finding those groups by sweeping every
+// record makes one unreadable record cost every open in the system, which is the shape
+// CockroachDB avoids by recovering only what a transaction actually conflicts with. This
+// is the index that makes that possible: an open reads its own small range and nobody
+// else's.
+static inline int key_inflight(uint8_t *out, const char *name, uint64_t txnid) {
+	int n = snprintf((char *)out, KEYMAX, "weft/db/%s/INFLIGHT/", name);
+	put_be64(out + n, txnid);
+	return n + 8;
+}
+
+static inline int key_inflight_prefix(uint8_t *out, const char *name) {
+	return snprintf((char *)out, KEYMAX, "weft/db/%s/INFLIGHT/", name);
+}
+
 static inline int key_txn_all(uint8_t *out) {
 	return snprintf((char *)out, KEYMAX, "weft/txn/");
 }

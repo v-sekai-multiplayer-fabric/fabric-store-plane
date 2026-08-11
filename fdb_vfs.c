@@ -1432,6 +1432,15 @@ static fdb_error_t record_body(FDBTransaction *tr, void *ctx, int *final) {
 		fdb_transaction_set(tr, key, klen, val, 16);
 	}
 
+	// The same fact from each participant's side, so an open can find the groups that name
+	// it without reading every record there is. Written in this transaction, so a group is
+	// either invisible or fully indexed.
+	for (int i = 0; i < g_group.nparts; i++) {
+		int ilen = key_inflight(key, g_group.files[i]->name, c->txnid);
+		uint8_t one = 1;
+		fdb_transaction_set(tr, key, ilen, &one, 1);
+	}
+
 	uint8_t status = TXN_STAGING;
 	int klen = key_txn_status(key, c->txnid);
 	fdb_transaction_set(tr, key, klen, &status, 1);
@@ -1584,10 +1593,35 @@ static fdb_error_t set_status_body(FDBTransaction *tr, void *ctx, int *final) {
 	return 0;
 }
 
+// One participant, read back from the record.
+typedef struct {
+	char name[MAX_NAME];
+	uint64_t txid;
+	uint64_t size;
+} TxnPart;
+
+// Drop a decided record, and the marks it left on its participants.
+//
+// The marks are what an open looks at, so a record cleared without them leaves every
+// participant pointing at a record that is gone — and an open would then read a mark, find
+// nothing, and have to decide what that means. Clearing both together is what stops that
+// question ever being asked.
+struct drop_ctx {
+	uint64_t txnid;
+	const TxnPart *parts;
+	int nparts;
+};
+
 static fdb_error_t drop_record_body(FDBTransaction *tr, void *ctx, int *final) {
 	(void)final;
-	struct status_ctx *c = ctx;
-	uint8_t from[KEYMAX], to[KEYMAX];
+	struct drop_ctx *c = ctx;
+	uint8_t from[KEYMAX], to[KEYMAX], key[KEYMAX];
+
+	for (int i = 0; i < c->nparts; i++) {
+		int klen = key_inflight(key, c->parts[i].name, c->txnid);
+		fdb_transaction_clear(tr, key, klen);
+	}
+
 	int flen = key_txn_prefix(from, c->txnid);
 	int tlen = key_after(to, from, flen);
 	fdb_transaction_clear_range(tr, from, flen, to, tlen);
@@ -1645,13 +1679,6 @@ int weft_compact_due(sqlite3 *db) {
 // Both outcomes are idempotent, so two processes recovering the same record at once reach
 // the same end.
 
-// One participant, read back from the record.
-typedef struct {
-	char name[MAX_NAME];
-	uint64_t txid;
-	uint64_t size;
-} TxnPart;
-
 #define TXN_MAX_RECOVER 64
 
 struct recover_ctx {
@@ -1663,6 +1690,10 @@ struct recover_ctx {
 	// participants is a group decided on the wrong question: the missing one is exactly
 	// where an absent intent would be.
 	int complete;
+	// Why it was incomplete, because the two want opposite answers. A truncated read will
+	// succeed later and must be retried. A row that does not parse never will, and
+	// retrying it forever costs every open in the system.
+	int malformed;
 };
 
 // Read the participants of one record.
@@ -1696,10 +1727,10 @@ static fdb_error_t read_parts_body(FDBTransaction *tr, void *ctx, int *final) {
 			int rows = 0;
 			for (int i = 0; i < count; i++) {
 				rows++;
-				if (kv[i].value_length != 16) continue;
+				if (kv[i].value_length != 16) { c->malformed = 1; continue; }
 				int n = kv[i].key_length - flen;
-				if (n <= 0 || n >= MAX_NAME) continue;
-				if (c->nparts >= TXN_MAX_PARTS) continue;
+				if (n <= 0 || n >= MAX_NAME) { c->malformed = 1; continue; }
+				if (c->nparts >= TXN_MAX_PARTS) { c->malformed = 1; continue; }
 				TxnPart *p = &c->parts[c->nparts];
 				memcpy(p->name, kv[i].key + flen, (size_t)n);
 				p->name[n] = '\0';
@@ -1920,18 +1951,28 @@ static fdb_error_t prevent_body(FDBTransaction *tr, void *ctx, int *final) {
 
 // Decide one staging record and carry the decision out.
 static int recover_one(uint64_t txnid) {
-	struct recover_ctx c = {txnid, {{{0}, 0, 0}}, 0, 1, 0};
+	struct recover_ctx c = {txnid, {{{0}, 0, 0}}, 0, 1, 0, 0};
 	int rc = run_txn(read_parts_body, &c, 0, SQLITE_IOERR_READ);
 	if (rc != SQLITE_OK) return rc;
 	if (!c.complete) {
-		// Leave it staging rather than decide it on a subset of its participants. A later
-		// pass can read the whole record; a wrong decision here is not recoverable.
+		// Leave it staging rather than decide it on a subset of its participants. A wrong
+		// decision here is not recoverable.
+		//
+		// But only when a later pass could do better. A record whose rows do not parse
+		// will never be decidable, and leaving it staging means every open in the system
+		// re-reads it forever — a record nobody can finish becomes a tax on everybody.
+		// Parking it stops the retry without pretending to have decided it: the pages
+		// stay, and the record says plainly that it needs a person.
+		if (c.malformed) {
+			struct status_ctx s = {txnid, (uint8_t)TXN_STUCK};
+			return run_txn(set_status_body, &s, 1, SQLITE_IOERR_WRITE);
+		}
 		return SQLITE_OK;
 	}
 	if (c.nparts == 0) {
 		// A record with no participants decides nothing and cannot be committed.
-		struct status_ctx s = {txnid, TXN_ABORTED};
-		return run_txn(drop_record_body, &s, 1, SQLITE_IOERR_WRITE);
+		struct drop_ctx d = {txnid, c.parts, 0};
+		return run_txn(drop_record_body, &d, 1, SQLITE_IOERR_WRITE);
 	}
 
 	// Query every intent before changing anything, because the decision depends on all of
@@ -1953,7 +1994,8 @@ static int recover_one(uint64_t txnid) {
 		struct status_ctx s = {txnid, TXN_COMMITTED};
 		rc = run_txn(set_status_body, &s, 1, SQLITE_IOERR_WRITE);
 		if (rc != SQLITE_OK) return rc;
-		return run_txn(drop_record_body, &s, 1, SQLITE_IOERR_WRITE);
+		struct drop_ctx d = {txnid, c.parts, c.nparts};
+		return run_txn(drop_record_body, &d, 1, SQLITE_IOERR_WRITE);
 	}
 
 	// Prevent only the participants whose intent was missing.
@@ -1976,7 +2018,8 @@ static int recover_one(uint64_t txnid) {
 	struct status_ctx s = {txnid, TXN_ABORTED};
 	rc = run_txn(set_status_body, &s, 1, SQLITE_IOERR_WRITE);
 	if (rc != SQLITE_OK) return rc;
-	return run_txn(drop_record_body, &s, 1, SQLITE_IOERR_WRITE);
+	struct drop_ctx d = {txnid, c.parts, c.nparts};
+	return run_txn(drop_record_body, &d, 1, SQLITE_IOERR_WRITE);
 }
 
 struct sweep_ctx {
@@ -2062,6 +2105,66 @@ static fdb_error_t sweep_body(FDBTransaction *tr, void *ctx, int *final) {
 //
 // Safe to call from more than one thread and more than one process: every outcome it can
 // reach is idempotent, which is the property that lets any finder of a record decide it.
+struct inflight_ctx {
+	const char *name;
+	uint64_t txnid[TXN_MAX_RECOVER];
+	int n;
+	int complete;
+};
+
+// The groups that name one database, from its own side.
+static fdb_error_t inflight_body(FDBTransaction *tr, void *ctx, int *final) {
+	(void)final;
+	struct inflight_ctx *c = ctx;
+	uint8_t from[KEYMAX], to[KEYMAX];
+
+	c->n = 0;
+	c->complete = 0;
+	int flen = key_inflight_prefix(from, c->name);
+	int tlen = key_after(to, from, flen);
+
+	FDBFuture *f = fdb_transaction_get_range(tr, FDB_KEYSEL_FIRST_GREATER_OR_EQUAL(from, flen),
+	                                         FDB_KEYSEL_FIRST_GREATER_OR_EQUAL(to, tlen), 0, 0,
+	                                         FDB_STREAMING_MODE_WANT_ALL, 0, 0, 0);
+	fdb_error_t err = await(f);
+	if (!err) {
+		const FDBKeyValue *kv;
+		int count;
+		fdb_bool_t more;
+		err = fdb_future_get_keyvalue_array(f, &kv, &count, &more);
+		if (!err) {
+			for (int i = 0; i < count && c->n < TXN_MAX_RECOVER; i++) {
+				if (kv[i].key_length < 8) continue;
+				c->txnid[c->n++] = get_be64(kv[i].key + kv[i].key_length - 8);
+			}
+			c->complete = !more && count == c->n;
+		}
+	}
+	fdb_future_destroy(f);
+	return err;
+}
+
+// Decide the groups that name one database, before its fence goes up.
+//
+// This is what `vfs_open` needs and all it needs. Sweeping every record instead makes one
+// unreadable record cost every open in the system, and CockroachDB's answer to the same
+// question is the reason: a transaction recovers the record it actually conflicts with,
+// not every record there is. An open conflicts with exactly the groups naming the database
+// it is opening, and `INFLIGHT` is how it finds them without reading anybody else's.
+int weft_txn_recover_for(const char *name) {
+	struct inflight_ctx c = {name, {0}, 0, 0};
+	int rc = run_txn(inflight_body, &c, 0, SQLITE_IOERR_READ);
+	if (rc != SQLITE_OK) return rc;
+
+	for (int i = 0; i < c.n; i++) {
+		rc = recover_one(c.txnid[i]);
+		if (rc != SQLITE_OK) return rc;
+	}
+	return SQLITE_OK;
+}
+
+// Decide every staging record there is. Not on the open path: this is the sweep a
+// maintenance pass wants, where the cost belongs to whoever asked for it.
 int weft_txn_recover(void) {
 	for (;;) {
 		struct sweep_ctx c = {{0}, 0, 0};
@@ -2187,7 +2290,7 @@ static int vfs_open(sqlite3_vfs *vfs, const char *name, sqlite3_file *file, int 
 	if (strlen(want) >= MAX_NAME) return SQLITE_CANTOPEN;
 	snprintf(f->name, MAX_NAME, "%s", want);
 
-	// Decide every staging group before this open raises a fence.
+	// Decide the groups that name this database, before this open raises a fence.
 	//
 	// This ordering is not a preference. Opening raises the fence, and a fence raised over a
 	// group that is already implicitly committed prevents a commit that has happened: the
@@ -2199,9 +2302,12 @@ static int vfs_open(sqlite3_vfs *vfs, const char *name, sqlite3_file *file, int 
 	// while somebody remembers it is the kind of fault the rest of this suite exists to
 	// catch, so it lives here now, where it cannot be got wrong.
 	//
-	// The cost is one range read for each open. Records are dropped as they are decided, so
-	// in the steady state that read finds nothing and the sweep stops.
-	int rc = weft_txn_recover();
+	// Scoped to this database, and that is the whole difference between a check and an
+	// outage. A sweep of every record would make one record nobody can read fail every
+	// open in the system, which is a poison pill rather than a safeguard. The cost here is
+	// one small range read over this database's own prefix, and in the steady state it
+	// finds nothing.
+	int rc = weft_txn_recover_for(f->name);
 	if (rc != SQLITE_OK) return rc;
 
 	struct open_ctx c = {f};
