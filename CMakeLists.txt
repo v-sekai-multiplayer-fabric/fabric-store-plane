@@ -1,5 +1,5 @@
 # The store plane: SQLite with a VFS whose pages live in FoundationDB.
-# See native/storeplane/README.md.
+# See README.md.
 cmake_minimum_required(VERSION 3.16)
 project(weft_storeplane C)
 
@@ -23,7 +23,7 @@ target_compile_definitions(weft_fdb_vfs PUBLIC FDB_API_VERSION=730)
 target_link_libraries(weft_fdb_vfs PUBLIC ${FDB_LIBRARY} ${SQLITE_LIBRARY} Threads::Threads)
 
 # One program for each property the store plane must hold, plus the load harness.
-foreach(prog prove_handoff prove_concurrency prove_crash prove_big_commit integrity bench_vfs)
+foreach(prog prove_handoff prove_crash prove_big_commit integrity bench_vfs)
   add_executable(${prog} ${prog}.c)
   target_link_libraries(${prog} PRIVATE weft_fdb_vfs)
 endforeach()

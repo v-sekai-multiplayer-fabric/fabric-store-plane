@@ -707,10 +707,23 @@ struct flush_ctx {
 
 // Refuse the transaction unless this handle still owns the database.
 //
-// Every write transaction reads the fence, not only the commit. A writer that lost
-// ownership must not compact either, because compaction drops the shard version that the
-// owner is reading. Reading the fence here also makes FoundationDB reject the
-// transaction if the fence moves before it commits.
+// Why there is a fence at all. The locks above are no-ops, so two writers both believe
+// they hold the write lock. Run that way, both reported success, `PRAGMA integrity_check`
+// passed, and one writer's 300 rows were simply gone: silent loss against a database that
+// checks out as healthy. The fence turned that into a refusal the caller can see. A store
+// may refuse a write, and it may not accept a write and drop it.
+//
+// The single-writer invariant is not absolute, which is why this cannot be assumed away.
+// `Weft.Actors` says Horde is CRDT-based and chooses availability, so during a partition
+// each side may briefly run its own instance. rivet reaches the same answer, in
+// `depot_client_types::is_head_fence_mismatch`.
+//
+// Every write transaction reads the fence, not only the commit. The first version checked
+// it in the commit alone, so a stale writer could still compact. Compaction drops the
+// shard version the owner is reading, the owner then read pages that were gone, and both
+// writers failed against a database that was intact. A fence that covers one write path
+// and not the others is not a fence. Reading the fence here also makes FoundationDB reject
+// the transaction if the fence moves before it commits.
 static fdb_error_t check_fence(FDBTransaction *tr, FdbFile *file, int *final) {
 	uint8_t key[KEYMAX];
 	uint64_t fence = 0;
@@ -862,7 +875,6 @@ struct fold_ctx {
 	uint32_t lo, hi;  // the window of pages this pass folds
 	uint8_t *pages;   // hi - lo pages
 	uint8_t *present; // one flag for each page in the window
-	uint32_t kept;
 };
 
 // Read a window of pages through the read path, so the fold sees exactly what a reader
@@ -952,7 +964,7 @@ static int compact(FdbFile *f) {
 	uint32_t window = STAGE_TXN_PAGES;
 	if (window > npages) window = npages;
 
-	struct fold_ctx c = {f, as_of, 0, 0, NULL, NULL, 0};
+	struct fold_ctx c = {f, as_of, 0, 0, NULL, NULL};
 	c.pages = malloc((size_t)window * PAGE);
 	c.present = malloc(window);
 	if (!c.pages || !c.present) {

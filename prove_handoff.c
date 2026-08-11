@@ -5,8 +5,7 @@
 //   prove_handoff read  <db>   read them back in a new process
 //
 // The two runs share nothing but FoundationDB. The reader has no file to copy and no
-// restore step, which is what makes a handoff cost nothing. See
-// native/storeplane/README.md.
+// restore step, which is what makes a handoff cost nothing. See README.md.
 
 #include <sqlite3.h>
 #include <stdio.h>
