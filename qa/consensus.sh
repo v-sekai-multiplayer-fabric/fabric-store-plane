@@ -43,6 +43,15 @@ start() { # start <index>
 	log "started z$i on $port pid=$pid"
 }
 
+# Killing is not stopping. `kill -9` returns at once, but the process still holds its port
+# and data directory until the kernel reaps it, so a restart on the same port loses a race
+# that a `sleep` used to hide. `wait` blocks until the child is really gone, which is the
+# state we need and not a guess at how long it takes.
+stop() { # stop <pid...>
+	for p in "$@"; do kill -9 "$p" 2>/dev/null || true; done
+	for p in "$@"; do wait "$p" 2>/dev/null || true; done
+}
+
 faulttol() {
 	"$CLI" -C "$CF" --exec 'status' --timeout 30 2>&1 |
 		grep -oE 'Fault Tolerance +- +[0-9]+ (zones|machines)' | head -1
@@ -113,7 +122,7 @@ wait_for "$KEYS keys readable" 120 keys_are "$KEYS"
 # The claim is that losing one zone loses nothing. Reading a number that says so is not
 # evidence; killing the zone is.
 log "=== 3. kill zone z2 ==="
-kill -9 "$PID2" 2>/dev/null || true
+stop "$PID2"
 wait_for "available with one zone down" 180 cluster_answers
 wait_for "$KEYS keys still readable" 120 keys_are "$KEYS"
 log "survived one zone loss. degraded tolerance: $(faulttol)"
@@ -124,7 +133,7 @@ wait_for "available again" 180 cluster_answers
 wait_for "tolerance back to 1 zone" 240 tolerance_is '1 zones'
 
 log "=== 5. durability across a full restart ==="
-for p in "${PIDS[@]}"; do kill -9 "$p" 2>/dev/null || true; done
+stop "${PIDS[@]}"
 PIDS=()
 for i in 1 2 3; do start "$i"; done
 wait_for "available after a full stop" 240 cluster_answers
@@ -136,7 +145,7 @@ log "=== 6. lose consensus: kill two of three ==="
 # and FoundationDB must refuse service rather than accept writes it cannot order. A cluster
 # that stayed writable here can split-brain, and it would pass every other stage while doing
 # it.
-kill -9 "$PID2" "$PID3" 2>/dev/null || true
+stop "$PID2" "$PID3"
 wait_for "refusing service without quorum" 180 cluster_refuses
 if "$CLI" -C "$CF" --exec 'writemode on; set weft/qa/nope v' --timeout 15 2>&1 | grep -q 'Committed'; then
 	fail "committed a write with no quorum"
