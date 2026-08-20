@@ -1,4 +1,4 @@
-// Prove the property the store plane decision rests on: an actor's database has no
+// Prove the property the store decision rests on: an actor's database has no
 // local file, so a different process reads it with no copy and no restore.
 //
 //   prove_handoff write <db>   write rows, then exit

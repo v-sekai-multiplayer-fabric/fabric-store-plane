@@ -12,7 +12,7 @@ tears the database, or it covers every crash point and finds none.
 
 The ladder comes from `plausible-witness-dag`. It escalates only when it must:
 
-* plausible samples the candidate window at each rung, so a broken store plane fails
+* plausible samples the candidate window at each rung, so a broken store fails
   fast, wherever the fault sits in the range;
 * the deterministic readback then walks the crash points in order, and it reports
   whether it covered the whole range or ran out of budget.
@@ -31,7 +31,7 @@ Against the layout that committed each `xWrite` on its own, the search finds a w
 the first rung. Against the layout `fdb_vfs.c` holds now, where a commit is one
 transaction, it covers the space and finds none.
 
-How many candidates each run covered is in weft's `docs/logbook/store_plane.md`, and not
+How many candidates each run covered is in weft's `docs/logbook/store.md`, and not
 here, because a count that lives in two places goes stale in one of them.
 -/
 
@@ -50,7 +50,7 @@ structure Config where
 
 /-- The commit sizes the search covers.
 
-A crash point alone is one dimension, and it is not the only way the store plane can
+A crash point alone is one dimension, and it is not the only way the store can
 break. The size of a commit picks the path the code takes: a commit of one page and a
 commit of many pages take different branches, and the pages of a large commit are
 written before the head moves. So the search runs over the product of the two, and a
@@ -205,7 +205,7 @@ def main (argv : List String) : IO UInt32 := do
         at commit sizes {rowChoices.toList}"
 
       let (found, lvl, trace) ←
-        resolve "store plane: a crash that tears the database"
+        resolve "store: a crash that tears the database"
           crashCandidate crashReadback (crashLadder total)
 
       let probes ← probesRef.get

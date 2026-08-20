@@ -16,7 +16,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 cmake_minimum_required(VERSION 3.19)
-project(weft_storeplane_fuzz CXX)
+project(weft_store_fuzz CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

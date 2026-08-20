@@ -1,4 +1,4 @@
-# clangd configuration for the store plane.
+# clangd configuration for the store.
 #
 # The build needs FoundationDB and SQLite headers. An editor on a host without them
 # reports every include as missing and then guesses at every type.
@@ -20,7 +20,7 @@
 # `fdb_c_types.h` is needed as well, because the published headers tarball does not carry
 # it. Take it from the image the `Containerfile` builds:
 #
-#   podman create --name h fabric-store-plane:latest
+#   podman create --name h fabric-store:latest
 #   podman cp h:/usr/include/foundationdb/fdb_c_types.h .deps/
 #   podman rm -f h
 #

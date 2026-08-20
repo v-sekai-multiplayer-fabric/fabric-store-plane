@@ -1,6 +1,6 @@
-// The store plane: one SQLite database for each avatar, and a thread for each core.
+// The store: one SQLite database for each avatar, and a thread for each core.
 //
-//   storeplane [shards]
+//   store [shards]
 //
 // A caller never opens a database. It names an avatar on the ring and this process owns
 // every handle, which is what keeps one owner and one fence for each database. See
@@ -11,7 +11,7 @@
 // committing serially is bounded by that round trip however small the payload is. The depth
 // comes from the number of avatars committing at once: many threads, each blocked in its own
 // commit, are many transactions in flight through the one FoundationDB network thread the
-// client process has. `docs/logbook/store_plane.md` measured that as 44 times, and this loop
+// client process has. `docs/logbook/store.md` measured that as 44 times, and this loop
 // is the thing that was missing to reach it.
 //
 // Why a service for each shard. Publish and subscribe is a broadcast, so every subscriber on
@@ -48,8 +48,8 @@ namespace {
 
 std::atomic<bool> g_running {true};
 
-// How many commits this process has completed, so the claim the plane exists to test —
-// that commits per second rise with avatar count — can be read off a running plane.
+// How many commits this process has completed, so the claim the store exists to test —
+// that commits per second rise with avatar count — can be read off a running store.
 std::atomic<std::uint64_t> g_commits {0};
 
 // One avatar's database, held open for as long as the caller owns it.
@@ -66,7 +66,7 @@ int exec(sqlite3* db, const char* sql) {
     char* err = nullptr;
     const int rc = sqlite3_exec(db, sql, nullptr, nullptr, &err);
     if (rc != SQLITE_OK) {
-        std::fprintf(stderr, "storeplane: %s -> %s\n", sql, err ? err : "?");
+        std::fprintf(stderr, "store: %s -> %s\n", sql, err ? err : "?");
     }
     sqlite3_free(err);
     return rc;
@@ -85,7 +85,7 @@ sqlite3* open_avatar(std::uint64_t avatar) {
     sqlite3* db = nullptr;
     const int flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE;
     if (sqlite3_open_v2(name, &db, flags, "weft_fdb") != SQLITE_OK) {
-        std::fprintf(stderr, "storeplane: open %s: %s\n", name,
+        std::fprintf(stderr, "store: open %s: %s\n", name,
                      db ? sqlite3_errmsg(db) : "no handle");
         sqlite3_close(db);
         return nullptr;
@@ -200,7 +200,7 @@ iox2_port_factory_pub_sub_h open_service(iox2_node_h& node, const char* service_
     iox2_service_name_h name = nullptr;
     if (iox2_service_name_new(nullptr, service_name, std::strlen(service_name), &name)
         != IOX2_OK) {
-        std::fprintf(stderr, "storeplane: no service name %s\n", service_name);
+        std::fprintf(stderr, "store: no service name %s\n", service_name);
         return nullptr;
     }
 
@@ -211,14 +211,14 @@ iox2_port_factory_pub_sub_h open_service(iox2_node_h& node, const char* service_
             &builder, iox2_type_variant_e_FIXED_SIZE, type_name, std::strlen(type_name), size,
             align)
         != IOX2_OK) {
-        std::fprintf(stderr, "storeplane: type details rejected for %s\n", service_name);
+        std::fprintf(stderr, "store: type details rejected for %s\n", service_name);
         iox2_service_name_drop(name);
         return nullptr;
     }
 
     iox2_port_factory_pub_sub_h service = nullptr;
     if (iox2_service_builder_pub_sub_open_or_create(builder, nullptr, &service) != IOX2_OK) {
-        std::fprintf(stderr, "storeplane: no service %s\n", service_name);
+        std::fprintf(stderr, "store: no service %s\n", service_name);
         iox2_service_name_drop(name);
         return nullptr;
     }
@@ -239,7 +239,7 @@ void shard_loop(std::uint32_t shard) {
     if (iox2_node_builder_create(iox2_node_builder_new(nullptr), nullptr,
                                  iox2_service_type_e_IPC, &node)
         != IOX2_OK) {
-        std::fprintf(stderr, "storeplane: shard %u has no node\n", shard);
+        std::fprintf(stderr, "store: shard %u has no node\n", shard);
         return;
     }
 
@@ -259,7 +259,7 @@ void shard_loop(std::uint32_t shard) {
             iox2_port_factory_pub_sub_subscriber_builder(&requests, nullptr), nullptr,
             &subscriber)
         != IOX2_OK) {
-        std::fprintf(stderr, "storeplane: shard %u has no subscriber\n", shard);
+        std::fprintf(stderr, "store: shard %u has no subscriber\n", shard);
         iox2_node_drop(node);
         return;
     }
@@ -269,7 +269,7 @@ void shard_loop(std::uint32_t shard) {
             iox2_port_factory_pub_sub_publisher_builder(&replies, nullptr), nullptr,
             &publisher)
         != IOX2_OK) {
-        std::fprintf(stderr, "storeplane: shard %u has no publisher\n", shard);
+        std::fprintf(stderr, "store: shard %u has no publisher\n", shard);
         iox2_node_drop(node);
         return;
     }
@@ -279,7 +279,7 @@ void shard_loop(std::uint32_t shard) {
     while (g_running.load(std::memory_order_relaxed)) {
         iox2_sample_h sample = nullptr;
         if (iox2_subscriber_receive(&subscriber, nullptr, &sample) != IOX2_OK) {
-            std::fprintf(stderr, "storeplane: shard %u receive failed\n", shard);
+            std::fprintf(stderr, "store: shard %u receive failed\n", shard);
             break;
         }
         if (sample == nullptr) {
@@ -306,7 +306,7 @@ void shard_loop(std::uint32_t shard) {
 
         iox2_sample_mut_h loan = nullptr;
         if (iox2_publisher_loan_slice_uninit(&publisher, nullptr, &loan, 1) != IOX2_OK) {
-            std::fprintf(stderr, "storeplane: shard %u has no loan\n", shard);
+            std::fprintf(stderr, "store: shard %u has no loan\n", shard);
             break;
         }
         void* reply_payload = nullptr;
@@ -316,7 +316,7 @@ void shard_loop(std::uint32_t shard) {
         serve(avatars, in, *out);
 
         if (iox2_sample_mut_send(loan, nullptr) != IOX2_OK) {
-            std::fprintf(stderr, "storeplane: shard %u send failed\n", shard);
+            std::fprintf(stderr, "store: shard %u send failed\n", shard);
             break;
         }
     }
@@ -348,14 +348,14 @@ int main(int argc, char** argv) {
     iox2_set_log_level_from_env_or(iox2_log_level_e_ERROR);
 
     if (const int err = weft_fdb_start(std::getenv("WEFT_FDB_CLUSTER_FILE"))) {
-        std::fprintf(stderr, "storeplane: FoundationDB did not start: %d\n", err);
+        std::fprintf(stderr, "store: FoundationDB did not start: %d\n", err);
         return 1;
     }
     // Not the default VFS. Every database this process opens names it, and nothing else
     // should get it by accident.
     weft_vfs_register(0);
 
-    std::printf("storeplane: %u shards, one database for each avatar\n", shards);
+    std::printf("store: %u shards, one database for each avatar\n", shards);
     std::fflush(stdout);
 
     std::vector<std::thread> threads;
@@ -367,7 +367,7 @@ int main(int argc, char** argv) {
         thread.join();
     }
 
-    std::printf("storeplane: %" PRIu64 " commits\n", g_commits.load());
+    std::printf("store: %" PRIu64 " commits\n", g_commits.load());
     weft_fdb_stop();
     return 0;
 }

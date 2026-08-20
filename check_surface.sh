@@ -1,9 +1,9 @@
 #!/bin/sh
-# Check that the store plane calls the FoundationDB surface it says it calls.
+# Check that the store calls the FoundationDB surface it says it calls.
 #
 #   check_surface.sh <build-dir>
 #
-# `foundationdb.allow` beside this script lists the C ABI the plane uses and says why each
+# `foundationdb.allow` beside this script lists the C ABI the store uses and says why each
 # absence is an absence. This checks the list against reality, because a list nothing checks
 # goes stale and the stale copy still reads as authoritative — the same argument
 # `weft/limits.hpp` makes about its transcribed numbers.

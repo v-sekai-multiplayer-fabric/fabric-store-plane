@@ -1,4 +1,4 @@
-# The store plane: SQLite with a VFS whose pages live in FoundationDB.
+# The store: SQLite with a VFS whose pages live in FoundationDB.
 #
 # Three stages, and each exists for one reason. iceoryx2 keeps the Rust toolchain out of
 # the runtime image. The build stage carries the FoundationDB and SQLite headers. The
@@ -41,7 +41,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   && dpkg -i /tmp/fdb.deb && rm /tmp/fdb.deb \
   && apt-get purge -y curl && rm -rf /var/lib/apt/lists/*
 COPY --from=iceoryx /opt/iceoryx /opt/iceoryx
-COPY --from=build /src/build/ /usr/local/lib/store-plane/
+COPY --from=build /src/build/ /usr/local/lib/store/
 ENV LD_LIBRARY_PATH=/opt/iceoryx/lib64
 ENV WEFT_FDB_CLUSTER_FILE=/etc/foundationdb/fdb.cluster
-CMD ["/bin/sh", "-c", "ls /usr/local/lib/store-plane"]
+CMD ["/bin/sh", "-c", "ls /usr/local/lib/store"]

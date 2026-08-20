@@ -1,4 +1,4 @@
-# Build the store plane and run the programs that assert something.
+# Build the store and run the programs that assert something.
 #
 # Two jobs, because they need different things. `test` needs a live FoundationDB, since
 # every program here is a program about a database. `fuzz` needs neither FoundationDB nor
@@ -54,7 +54,7 @@ jobs:
           cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
           cmake --build build -j
 
-      # The plane calls the FoundationDB surface it says it calls, and every read is
+      # The store calls the FoundationDB surface it says it calls, and every read is
       # serializable. `foundationdb.allow` is the list and says why each absence is one.
       # This needs no cluster: it reads the built library's undefined symbols.
       - name: The store surface is the one that was argued for

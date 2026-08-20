@@ -1,19 +1,19 @@
-// Drive the store plane and measure the claim it exists to test.
+// Drive the store and measure the claim it exists to test.
 //
 //   store_driver <avatars> <seconds> [shards]
 //
-// The claim, from `docs/logbook/store_plane.md`: commits in flight are worth 44 times, and
+// The claim, from `docs/logbook/store.md`: commits in flight are worth 44 times, and
 // more database handles are worth nothing. So this opens many avatars, keeps many commits
 // outstanding at once, and prints commits for each second.
 //
 // What actually creates depth, which is worth being exact about. A commit blocks its thread
 // inside `xSync` until FoundationDB answers, so one thread can hold exactly one commit in
-// flight. The plane runs a thread for each shard, so the number of commits in flight is the
+// flight. The store runs a thread for each shard, so the number of commits in flight is the
 // number of shards, and no arrangement of avatars changes that. Avatars past the shard count
 // queue behind the ones being served; they do not add depth.
 //
 // That is why this sweeps shards rather than avatars alone. Avatar count still has to be at
-// least the shard count, or shards sit idle and the measurement is of an empty plane, so the
+// least the shard count, or shards sit idle and the measurement is of an empty store, so the
 // driver refuses that case rather than reporting a number for it.
 //
 // SPDX-License-Identifier: Apache-2.0
@@ -160,7 +160,7 @@ int main(int argc, char** argv) {
     if (avatars < shards) {
         std::fprintf(stderr,
                      "store_driver: %" PRIu64 " avatars over %u shards leaves shards idle, so\n"
-                     "the number would measure an empty plane. Give at least one each.\n",
+                     "the number would measure an empty store. Give at least one each.\n",
                      avatars, shards);
         return 2;
     }
@@ -180,7 +180,7 @@ int main(int argc, char** argv) {
     std::uint64_t ok = 0;
     std::uint64_t failed = 0;
 
-    // Open every avatar, and give each one a table to write into. The plane raises a fence
+    // Open every avatar, and give each one a table to write into. The store raises a fence
     // for each on open, so this is also where ownership is taken.
     for (std::uint64_t avatar = 0; avatar < avatars; ++avatar) {
         Shard& shard = ports[weft::store_shard_of(avatar, shards)];

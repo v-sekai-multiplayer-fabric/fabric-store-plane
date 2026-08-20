@@ -1,6 +1,6 @@
 // A SQLite VFS whose files live in FoundationDB.
 //
-// This is the store plane described in README.md, beside this file. There is no
+// This is the store described in README.md, beside this file. There is no
 // local file, so an actor's database moves between machines with no copy and no restore
 // step.
 //
@@ -51,7 +51,7 @@
 // check is a round trip for every query. The pragma tells SQLite that nothing else can
 // change the file, so it trusts its page cache and stops the re-read. An actor is the
 // single writer of its own store, so the statement is true. It was worth more than the
-// layout of the pages; weft's `docs/logbook/store_plane.md` holds the number.
+// layout of the pages; weft's `docs/logbook/store.md` holds the number.
 //
 // Every transaction runs in the retry loop that FoundationDB documents.
 // `fdb_transaction_on_error` decides if an error may be retried, and waits before the
@@ -180,7 +180,7 @@ void weft_fdb_stop(void) {
 	pthread_join(g_network_thread, NULL);
 }
 
-// Block the calling thread until a future is ready. The store plane runs its own
+// Block the calling thread until a future is ready. The store runs its own
 // threads, so blocking here does not touch a BEAM scheduler.
 static fdb_error_t await(FDBFuture *f) {
 	fdb_error_t err = fdb_future_block_until_ready(f);
@@ -1282,7 +1282,7 @@ struct seq_ctx {
 	uint64_t txnid;
 };
 
-// The next group txid, from a counter in the store. Two planes must not choose the same
+// The next group txid, from a counter in the store. Two stores must not choose the same
 // one, so it is a read and a write in one transaction rather than a clock or a guess.
 static fdb_error_t txn_seq_body(FDBTransaction *tr, void *ctx, int *final) {
 	(void)final;
