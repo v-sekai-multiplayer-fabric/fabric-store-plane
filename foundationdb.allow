@@ -1,4 +1,4 @@
-# The FoundationDB C ABI the store plane calls, and nothing else.
+# The FoundationDB C ABI the store calls, and nothing else.
 #
 # Read `check_surface.sh` beside this file for how it is enforced. The list is checked
 # against the symbols the built library actually leaves undefined, so it cannot go stale
@@ -66,7 +66,7 @@ fdb_transaction_clear_range
 #
 # fdb_transaction_watch
 #     Superseded before it was ever wanted. A watch is a network round trip; iceoryx2 is
-#     shared memory on one machine and a send is a pointer handoff. Any cross-plane
+#     shared memory on one machine and a send is a pointer handoff. Any cross-store
 #     notification is cheaper over the bus that is already there.
 #
 # fdb_transaction_atomic_op
@@ -76,7 +76,7 @@ fdb_transaction_clear_range
 #
 # fdb_transaction_get_versionstamp
 #     The strongest candidate, and still not taken. `weft/txn/NEXT` is a genuine hot key:
-#     every plane allocating a group txid conflicts with every other on it. But it is only
+#     every store allocating a group txid conflicts with every other on it. But it is only
 #     touched on group commits, `g_group_lock` already serialises those per process, and
 #     the backend-neutral fix — allocate txids in blocks and hand them out in process —
 #     removes nearly all of it without leaving the surface.

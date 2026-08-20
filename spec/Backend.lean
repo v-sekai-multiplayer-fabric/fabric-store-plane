@@ -375,7 +375,7 @@ theorem read_ahead_is_safe_on_any_backend
 
 /-! ## The theorem this file exists for -/
 
-/-- **Substitutable.** A backend meeting the laws carries the store plane: an enumeration
+/-- **Substitutable.** A backend meeting the laws carries the store: an enumeration
 that finished indexes every staged page, a resolve over it is honest, a covered key really
 was in the range, a commit is one of its two ends, and read-ahead cannot change an answer.
 

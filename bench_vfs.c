@@ -8,7 +8,7 @@
 // The number that matters is the ratio, and where the ratio comes from.
 //
 // Three results shape the design. Every number, and the cluster and the settings that
-// produced it, is in weft's `docs/logbook/store_plane.md`.
+// produced it, is in weft's `docs/logbook/store.md`.
 //
 //   - A read costs what a local read costs. Point reads and a scan both land within 1.1
 //     times of SQLite on a local file, because the page cache absorbs them and no round

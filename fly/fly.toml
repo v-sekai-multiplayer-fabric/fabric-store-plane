@@ -1,11 +1,11 @@
-# The store plane on Fly.
+# The store on Fly.
 #
 #   fly deploy --config fly/fly.toml
 #
-# There is no plane process yet. The VFS is built and the programs beside it exercise it,
+# There is no store process yet. The VFS is built and the programs beside it exercise it,
 # but nothing serves a request, because the thread-per-core harness is not written. So
 # this deploys the image and runs no service. See README.md.
-app            = "fabric-store-plane"
+app            = "fabric-store"
 primary_region = "sea"
 
 [build]
@@ -14,10 +14,10 @@ primary_region = "sea"
 [env]
   WEFT_FDB_CLUSTER_FILE = "/etc/foundationdb/fdb.cluster"
 
-# No [[services]]. A plane has no networking. It reaches FoundationDB as a client, which
-# is below the planes and not a service this app offers.
+# No [[services]]. A store has no networking. It reaches FoundationDB as a client, which
+# is below the stores and not a service this app offers.
 #
-# It reaches the control plane over iceoryx2, which is shared memory on one machine. So
+# It reaches the control store over iceoryx2, which is shared memory on one machine. So
 # this app and the machine it talks to are the same machine, and a second Fly app cannot
 # be the other end. See README.md.
 

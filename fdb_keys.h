@@ -1,4 +1,4 @@
-// The keys of the store plane layout.
+// The keys of the store layout.
 //
 // This is layer 1 of the four `fdb_vfs.c` describes, split out so it can be tested
 // without FoundationDB or SQLite. Nothing here allocates, does I/O, or holds state: a key

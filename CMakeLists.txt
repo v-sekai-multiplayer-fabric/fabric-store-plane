@@ -1,10 +1,10 @@
-# The store plane: SQLite with a VFS whose pages live in FoundationDB.
+# The store: SQLite with a VFS whose pages live in FoundationDB.
 # See README.md.
 #
-# C for the VFS and the programs that exercise it, C++ for the plane, because the harness
+# C for the VFS and the programs that exercise it, C++ for the store, because the harness
 # and the iceoryx2 dispatch table it generates are C++.
 cmake_minimum_required(VERSION 3.22)
-project(weft_storeplane C CXX)
+project(weft_store C CXX)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -27,7 +27,7 @@ target_include_directories(weft_fdb_vfs PUBLIC
 target_compile_definitions(weft_fdb_vfs PUBLIC FDB_API_VERSION=730)
 target_link_libraries(weft_fdb_vfs PUBLIC ${FDB_LIBRARY} ${SQLITE_LIBRARY} Threads::Threads)
 
-# One program for each property the store plane must hold, plus the load harness.
+# One program for each property the store must hold, plus the load harness.
 foreach(prog prove_handoff prove_crash prove_big_commit prove_parallel_commit integrity bench_vfs)
   add_executable(${prog} ${prog}.c)
   target_link_libraries(${prog} PRIVATE weft_fdb_vfs)
@@ -35,18 +35,18 @@ endforeach()
 
 # The harness, as a subtree. It carries the iceoryx2 C ABI as a dlsym table, the shared
 # limits, and the payload types. Nothing here links iceoryx2: the table dlopens it, so the
-# plane builds on a machine that has never seen it and fails at start rather than at link.
+# store builds on a machine that has never seen it and fails at start rather than at link.
 #
 # The proof programs are the harness's own and belong to it, not to this build.
 set(WEFT_HARNESS_PROOF OFF CACHE BOOL "" FORCE)
 add_subdirectory(thirdparty/harness)
 
-# The plane. One SQLite database for each avatar, and a thread for each core.
-add_executable(storeplane storeplane.cpp)
-target_link_libraries(storeplane PRIVATE weft_fdb_vfs weft::harness)
-target_compile_options(storeplane PRIVATE -Wall -Wextra)
+# The store. One SQLite database for each avatar, and a thread for each core.
+add_executable(store store.cpp)
+target_link_libraries(store PRIVATE weft_fdb_vfs weft::harness)
+target_compile_options(store PRIVATE -Wall -Wextra)
 
-# The other end of the ring, which measures what the plane is for. It opens no database and
+# The other end of the ring, which measures what the store is for. It opens no database and
 # links no VFS, because a caller is not supposed to be able to.
 add_executable(store_driver store_driver.cpp)
 target_link_libraries(store_driver PRIVATE weft::harness)
